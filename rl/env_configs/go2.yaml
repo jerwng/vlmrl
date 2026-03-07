@@ -37,9 +37,9 @@ experiment:
     reward_type: LocomotionWithHeadingReward
     reward_params:
       tracking_w_exp_xy: 5.0
-      tracking_w_exp_heading: 5.0
+      tracking_w_exp_heading: 10.0
       tracking_w_sum_xy: 2.0
-      tracking_w_sum_heading: 1.0
+      tracking_w_sum_heading: 2.0
       air_time_coeff: 0.1
       joint_acc_coeff: 2.0e-05
       air_time_max: 0.5
