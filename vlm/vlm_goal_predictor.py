@@ -148,9 +148,10 @@ class DummyVLMPredictor(VLMGoalPredictor):
         goal = {
             'vel_x': 1.0,
             'vel_y': 0.0,
-            'heading': heading
+            'heading': heading,
+            'stop': False,
         }
-        
+
         return goal
 
 
@@ -329,8 +330,9 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
             'vel_x': 1.0,   # Default forward
             'vel_y': 0.0,
             'heading': current_heading,  # Absolute heading
+            'stop': False,
         }
-        
+
         # Try JSON parsing (preferred format)
         try:
             # Extract JSON from response (handle markdown code blocks)
@@ -339,55 +341,81 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
             if not json_match:
                 json_match = re.search(r'{.*?}', response, re.DOTALL)
             print(f"json match 2 {json_match}")
-            
+
             if json_match:
                 json_str = json_match.group(1) if json_match.lastindex else json_match.group(0)
                 data = json.loads(json_str)
-                
-                # New format: {"u": <number between -1 and 1>}
+
+                # New format: {"u": <number or null>, "stop": <bool>}
                 if 'u' in data:
-                    u = float(data['u'])
-                    
+                    stop = bool(data.get("stop", False))
+
+                    # Handle stop=true: halt the robot
+                    if stop:
+                        print("VLM signaled STOP — setting vel_x=0.0")
+                        goal['vel_x'] = 0.0
+                        goal['vel_y'] = 0.0
+                        goal['relative_heading'] = 0.0
+                        goal['heading'] = current_heading
+                        goal['stop'] = True
+                        return goal
+
+                    u_raw = data['u']
+
+                    # Handle null (Python None) or NaN: target not visible
+                    if u_raw is None:
+                        print("Target not visible (u=null), maintaining current heading")
+                        goal['relative_heading'] = 0.0
+                        goal['heading'] = current_heading
+                        goal['vel_x'] = 1.0
+                        goal['stop'] = False
+                        return goal
+
+                    u = float(u_raw)
+
                     # Handle NaN case (target not visible)
                     if np.isnan(u):
                         print("Target not visible (u=nan), maintaining current heading")
                         goal['relative_heading'] = 0.0
                         goal['heading'] = current_heading
                         goal['vel_x'] = 1.0  # Keep moving forward
+                        goal['stop'] = False
                         return goal
-                    
+
                     # Clamp u to [-1, 1]
                     u = np.clip(u, -1.0, 1.0)
 
-                    if np.abs(u) < 0.1:
-                        u = 0.0
-  
+                    # if np.abs(u) < 0.1:
+                    #     u = 0.0
+
                     # Calculate relative heading: u * 45 degrees
                     relative_heading_degrees = -u * 45.0
                     relative_heading_radians = relative_heading_degrees * np.pi / 180.0
-                    
+
                     # Calculate absolute heading: current_heading + relative_heading
                     absolute_heading = current_heading + relative_heading_radians
-                    
+
                     goal['relative_heading'] = relative_heading_radians
                     goal['vel_x'] = 1.0  # Keep moving forward
-                    
+                    goal['stop'] = False
+
                     # Special case: u == 0, use previous heading if available
                     if u == 0.0 and self.previous_goal_heading is not None:
                         goal['heading'] = self.previous_goal_heading
                     else:
                         goal['heading'] = absolute_heading
                     return goal
-                    
+
         except (json.JSONDecodeError, ValueError, KeyError, AttributeError) as e:
             # Fall back to default
             print(f"Warning: JSON parsing failed ({e}), using default forward motion")
-        
+
         # Fallback: maintain current heading, move forward
         goal['relative_heading'] = 0.0
         goal['heading'] = current_heading
         goal['vel_x'] = 1.0
-        
+        goal['stop'] = False
+
         return goal
     
     def predict_goal(self, frame: np.ndarray, prompt: Optional[str] = None, current_heading: float = 0.0) -> Dict[str, float]:
@@ -411,22 +439,30 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         # Default prompt if none provided
         if prompt is None:
             prompt = (
-                "You are given ONE egocentric RGB image from a quadruped camera.\n\n"
-                "Task:\n"
-                "Locate the center of the red disk marker and report its horizontal position relative to the image center.\n\n"
-                "Definition:\n"
-                "- Let u be the normalized horizontal offset in [-1, 1].\n"
-                "- u = -1 means the target center is at the left edge.\n"
-                "- u = 0 means the target center is at the image centerline (forward).\n"
-                "- u = 1 means the target center is at the right edge.\n\n"
-                "Output ONLY JSON:\n"
-                "{\n"
-                '  \"u\": <number between -1 and 1>\n'
-                "}\n\n"
-                "Rules:\n"
-                "- Use a continuous value (not just -1, -0.5, 0, 0.5, 1).\n"
-                "- Round to 2 decimals.\n"
-                "- If the target is not visible, output {\"u\": nan}."
+                "You are the navigation controller for a quadruped robot.\n"
+                "You see ONE egocentric RGB image from the robot's head camera.\n"
+                "There is a red disk marker on the ground. Your job: guide the robot toward it or stop when close.\n\n"
+                "STEP 1 — Find the red disk.\n"
+                '- If the red disk is NOT visible, output: {"u": null, "stop": false}\n\n'
+                "STEP 2 — Estimate proximity.\n"
+                "- NEAR: The red disk appears LARGE and fills a significant portion of the image (roughly the bottom third or more).\n"
+                "- FAR: The red disk appears small or distant.\n\n"
+                "STEP 3 — Decide action.\n"
+                '- If NEAR: output {"u": 0, "stop": true}\n'
+                "- If FAR: continue to STEP 4.\n\n"
+                "STEP 4 — Measure horizontal offset u (only if FAR).\n"
+                "- u = normalized horizontal position of the disk center.\n"
+                "- u = -1: disk is at the far left edge.\n"
+                "- u = 0: disk is at the image center (straight ahead).\n"
+                "- u = +1: disk is at the far right edge.\n"
+                "- Use a continuous value, rounded to 2 decimals.\n\n"
+                "Output ONLY valid JSON — no explanation, no extra text:\n"
+                '{"u": <number -1 to 1 or null>, "stop": <true or false>}\n\n'
+                "Examples:\n"
+                '- Disk centered and large (NEAR) → {"u": 0, "stop": true}\n'
+                '- Disk centered and small (FAR)  → {"u": 0.00, "stop": false}\n'
+                '- Disk to the right, small (FAR) → {"u": 0.62, "stop": false}\n'
+                '- Disk not visible               → {"u": null, "stop": false}'
             )
         
         # Query model
