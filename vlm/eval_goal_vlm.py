@@ -73,6 +73,9 @@ def main():
     config.experiment.env_params["headless"] = args.headless
     env = factory.make(**config.experiment.env_params, **config.experiment.task_factory.params, default_camera_mode="ego_head", viewer_size=(336, 336))   
     
+    # When using MJX, episode auto-terminates when step reaches env.info.horizon
+    # Override the horizon value defined in the saved model to n_steps
+    env.info.horizon = args.n_steps 
     # Print configuration
     print("\n" + "="*60)
     print("Qwen3-VL Guided Navigation Configuration")
