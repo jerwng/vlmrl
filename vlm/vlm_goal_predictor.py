@@ -295,14 +295,13 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=20,
+                max_new_tokens=64,
                 do_sample=False,
                 temperature=0.0,
-                top_p=1.0,            # no truncation
+                top_p=1.0,
                 repetition_penalty=1.0
             )
-        
-        # Decode response
+
         generated_ids = [
             output_ids[len(input_ids):]
             for input_ids, output_ids in zip(inputs.input_ids, output_ids)
@@ -315,106 +314,75 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
     
     def parse_response_to_goal(self, response: str, current_heading: float = 0.0) -> Dict[str, float]:
         """
-        Parse VLM text response into navigation goals.
-        
+        Parse VLM response into navigation goals.
+
+        Expects JSON format: [{"bbox_2d": [x1, y1, x2, y2], "label": "..."}]
+        Coordinates are in [0, 1000] (normalized to model image grid).
+
         Args:
             response: Text response from VLM
-            current_heading: Current robot heading in radians (for calculating absolute heading)            
+            current_heading: Current robot heading in radians
+
         Returns:
-            Goal dictionary with vel_x, vel_y, heading (absolute), relative_heading
+            Goal dictionary with vel_x, vel_y, heading (absolute), relative_heading, stop
         """
         import re
-        import json
-        
+
+        # Area fraction of grounding coordinate space (1000x1000) that triggers stop
+        STOP_AREA_THRESHOLD = 0.10
+
         goal = {
-            'vel_x': 1.0,   # Default forward
+            'vel_x': 1.0,
             'vel_y': 0.0,
-            'heading': current_heading,  # Absolute heading
+            'heading': current_heading,
+            'relative_heading': 0.0,
             'stop': False,
         }
 
-        # Try JSON parsing (preferred format)
-        try:
-            # Extract JSON from response (handle markdown code blocks)
-            json_match = re.search(r'```(?:json)?\s*({.*?})\s*```', response, re.DOTALL)
-            print(f"json match 1 {json_match}")
-            if not json_match:
-                json_match = re.search(r'{.*?}', response, re.DOTALL)
-            print(f"json match 2 {json_match}")
+        # Parse JSON bbox_2d format: {"bbox_2d": [x1, y1, x2, y2], ...}
+        bbox_match = re.search(r'"bbox"\s*:\s*\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]', response)
 
-            if json_match:
-                json_str = json_match.group(1) if json_match.lastindex else json_match.group(0)
-                data = json.loads(json_str)
+        if bbox_match is None:
+            print("Red disk not detected in grounding output — stopping")
 
-                # New format: {"u": <number or null>, "stop": <bool>}
-                if 'u' in data:
-                    stop = bool(data.get("stop", False))
+            goal['vel_x'] = 0.0
+            goal['vel_y'] = 0.0
+            goal['stop'] = True
+            return goal
 
-                    # Handle stop=true: halt the robot
-                    if stop:
-                        print("VLM signaled STOP — setting vel_x=0.0")
-                        goal['vel_x'] = 0.0
-                        goal['vel_y'] = 0.0
-                        goal['relative_heading'] = 0.0
-                        goal['heading'] = current_heading
-                        goal['stop'] = True
-                        return goal
+        x1, y1, x2, y2 = (int(bbox_match.group(i)) for i in range(1, 5))
+        print(f"Detected bbox: ({x1},{y1}),({x2},{y2})")
 
-                    u_raw = data['u']
+        # Compute horizontal center in [0, 1000] and map to u in [-1, 1]
+        cx = (x1 + x2) / 2.0
+        u = (cx - 500.0) / 500.0
+        u = np.clip(u, -1.0, 1.0)
 
-                    # Handle null (Python None) or NaN: target not visible
-                    if u_raw is None:
-                        print("Target not visible (u=null), maintaining current heading")
-                        goal['relative_heading'] = 0.0
-                        goal['heading'] = current_heading
-                        goal['vel_x'] = 1.0
-                        goal['stop'] = False
-                        return goal
+        # Compute bbox area fraction to decide stop
+        area_fraction = (x2 - x1) * (y2 - y1) / 1_000_000.0
+        print(f"Bbox area fraction: {area_fraction:.4f} (threshold={STOP_AREA_THRESHOLD})")
 
-                    u = float(u_raw)
+        if area_fraction >= STOP_AREA_THRESHOLD:
+            print("Red disk is NEAR (large bbox) — signaling STOP")
+            goal['vel_x'] = 0.0
+            goal['vel_y'] = 0.0
+            goal['relative_heading'] = 0.0
+            goal['heading'] = current_heading
+            goal['stop'] = True
+            return goal
 
-                    # Handle NaN case (target not visible)
-                    if np.isnan(u):
-                        print("Target not visible (u=nan), maintaining current heading")
-                        goal['relative_heading'] = 0.0
-                        goal['heading'] = current_heading
-                        goal['vel_x'] = 1.0  # Keep moving forward
-                        goal['stop'] = False
-                        return goal
+        # Disk is visible but far: steer toward it
+        relative_heading_radians = -u * 45.0 * np.pi / 180.0
+        absolute_heading = current_heading + relative_heading_radians
 
-                    # Clamp u to [-1, 1]
-                    u = np.clip(u, -1.0, 1.0)
-
-                    # if np.abs(u) < 0.1:
-                    #     u = 0.0
-
-                    # Calculate relative heading: u * 45 degrees
-                    relative_heading_degrees = -u * 45.0
-                    relative_heading_radians = relative_heading_degrees * np.pi / 180.0
-
-                    # Calculate absolute heading: current_heading + relative_heading
-                    absolute_heading = current_heading + relative_heading_radians
-
-                    goal['relative_heading'] = relative_heading_radians
-                    goal['vel_x'] = 1.0  # Keep moving forward
-                    goal['stop'] = False
-
-                    # Special case: u == 0, use previous heading if available
-                    if u == 0.0 and self.previous_goal_heading is not None:
-                        goal['heading'] = self.previous_goal_heading
-                    else:
-                        goal['heading'] = absolute_heading
-                    return goal
-
-        except (json.JSONDecodeError, ValueError, KeyError, AttributeError) as e:
-            # Fall back to default
-            print(f"Warning: JSON parsing failed ({e}), using default forward motion")
-
-        # Fallback: maintain current heading, move forward
-        goal['relative_heading'] = 0.0
-        goal['heading'] = current_heading
+        goal['relative_heading'] = relative_heading_radians
         goal['vel_x'] = 1.0
         goal['stop'] = False
+
+        if u == 0.0 and self.previous_goal_heading is not None:
+            goal['heading'] = self.previous_goal_heading
+        else:
+            goal['heading'] = absolute_heading
 
         return goal
     
@@ -439,30 +407,9 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         # Default prompt if none provided
         if prompt is None:
             prompt = (
-                "You are the navigation controller for a quadruped robot.\n"
-                "You see ONE egocentric RGB image from the robot's head camera.\n"
-                "There is a red disk marker on the ground. Your job: guide the robot toward it or stop when close.\n\n"
-                "STEP 1 — Find the red disk.\n"
-                '- If the red disk is NOT visible, output: {"u": null, "stop": false}\n\n'
-                "STEP 2 — Estimate proximity.\n"
-                "- NEAR: The red disk appears LARGE and fills a significant portion of the image (roughly the bottom third or more).\n"
-                "- FAR: The red disk appears small or distant.\n\n"
-                "STEP 3 — Decide action.\n"
-                '- If NEAR: output {"u": 0, "stop": true}\n'
-                "- If FAR: continue to STEP 4.\n\n"
-                "STEP 4 — Measure horizontal offset u (only if FAR).\n"
-                "- u = normalized horizontal position of the disk center.\n"
-                "- u = -1: disk is at the far left edge.\n"
-                "- u = 0: disk is at the image center (straight ahead).\n"
-                "- u = +1: disk is at the far right edge.\n"
-                "- Use a continuous value, rounded to 2 decimals.\n\n"
-                "Output ONLY valid JSON — no explanation, no extra text:\n"
-                '{"u": <number -1 to 1 or null>, "stop": <true or false>}\n\n'
-                "Examples:\n"
-                '- Disk centered and large (NEAR) → {"u": 0, "stop": true}\n'
-                '- Disk centered and small (FAR)  → {"u": 0.00, "stop": false}\n'
-                '- Disk to the right, small (FAR) → {"u": 0.62, "stop": false}\n'
-                '- Disk not visible               → {"u": null, "stop": false}'
+                "Locate the red circular disk on the ground in this image. "
+                "Output its bounding box. "
+                "If no red disk is visible, output \"not visible\"."
             )
         
         # Query model

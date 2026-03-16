@@ -24,27 +24,18 @@ vlm_predictor = create_vlm_predictor(
 
 current_heading = 0.0  # Example current heading in radians
 
-prompt = """
-You are given ONE egocentric RGB image from a quadruped camera.
+prompt = """You are controlling a robot navigating toward a red disk target.
 
-Task:
-Locate the center of the red disk marker and report its horizontal position relative to the image center.
-
-Definition:
-- Let u be the normalized horizontal offset in [-1, 1].
-- u = -1 means the target center is at the left edge.
-- u = 0 means the target center is at the image centerline (forward).
-- u = 1 means the target center is at the right edge.
-
-Output ONLY JSON:
-{
-  "u": <number between -1 and 1>
-}
+Detect the red disk target in the image and return ONLY valid JSON:
+{"bbox": [x1, y1, x2, y2], "label": "object name"}
 
 Rules:
-- Use a continuous value (not just -1, -0.5, 0, 0.5, 1).
-- Round to 2 decimals.
-- If the target is not visible, output {"u": nan}.
+- Coordinates are in 0-1000 scale relative to image dimensions
+- Tightly bound the VISIBLE portion of the object
+- Detect even if partially occluded or cut off by image edge
+- If target not visible: {"bbox": null, "label": null}
+
+Target: {target}
 """
 
 frame = Image.open(args.image_path)
