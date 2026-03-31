@@ -33,6 +33,9 @@ def main():
                         help='Optional custom text prompt for Qwen3-VL. If not provided, uses default prompt that requests JSON with red disk marker analysis.')
     parser.add_argument('--trust_remote_code', action='store_true', default=True,
                         help='Trust remote code when loading model (default: True)')
+    parser.add_argument('--lora_adapter_path', type=str, default=None,
+                        help='Path to LoRA adapter directory. If provided, loads finetuned LoRA weights '
+                             'and uses the multi-object detection prompt.')
     
     # Environment configuration
     parser.add_argument('--use_mujoco', action='store_true',
@@ -62,7 +65,8 @@ def main():
     vlm_predictor = create_vlm_predictor(
         'huggingface',
         device=args.vlm_device,
-        trust_remote_code=args.trust_remote_code
+        trust_remote_code=args.trust_remote_code,
+        lora_adapter_path=args.lora_adapter_path,
     )
     print(f"Model: Qwen/Qwen3-VL-8B-Instruct (device: {args.vlm_device})")
     
@@ -83,6 +87,10 @@ def main():
     print(f"Agent: {args.agent_path}")
     print(f"VLM Model: Qwen/Qwen3-VL-8B-Instruct (device: {args.vlm_device})")
     print(f"Update Frequency: Every {args.vlm_update_freq} steps")
+    if args.lora_adapter_path:
+        print(f"LoRA Adapter: {args.lora_adapter_path}")
+    else:
+        print("LoRA Adapter: None (using base model)")
     if args.vlm_prompt:
         print(f"Custom Prompt: {args.vlm_prompt[:80]}..." if len(args.vlm_prompt) > 80 else f"Custom Prompt: {args.vlm_prompt}")
     else:

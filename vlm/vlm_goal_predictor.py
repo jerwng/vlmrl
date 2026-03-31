@@ -3,10 +3,13 @@ VLM Goal Predictor for Go2 Robot
 Processes environment frames and predicts navigation goals (heading, velocity)
 Uses Qwen/Qwen3-VL-8B-Instruct
 """
+import json
+import re
+
 import numpy as np
-from typing import Dict, Optional, Tuple, Any
-from PIL import Image
 import torch
+from PIL import Image
+from typing import Dict, List, Optional, Tuple, Any
 
 
 class VLMGoalPredictor:
@@ -159,21 +162,32 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
     """
     Qwen3-VL-8B-Instruct goal predictor.
     Hard-coded to use Qwen/Qwen3-VL-8B-Instruct.
+
+    Optionally loads a LoRA adapter via ``lora_adapter_path``.
+    When a LoRA adapter is loaded, the predictor uses the multi-object
+    detection prompt (DETECTION_PROMPT) and exposes all detected objects
+    via ``self.last_detections`` after each ``predict_goal()`` call.
     """
-    
-    def __init__(self, model_path: str = None, device: str = "cuda", 
-                 model_type: str = "auto", trust_remote_code: bool = True):
+
+    def __init__(self, model_path: str = None, device: str = "cuda",
+                 model_type: str = "auto", trust_remote_code: bool = True,
+                 lora_adapter_path: Optional[str] = None):
         """
         Initialize Qwen3-VL predictor.
-        
+
         Args:
             model_path: Ignored (always uses Qwen/Qwen3-VL-8B-Instruct)
             device: Device to run inference on ('cuda' or 'cpu')
             model_type: Ignored (kept for compatibility)
             trust_remote_code: Whether to trust remote code
+            lora_adapter_path: Optional path to a LoRA adapter directory.
+                If provided, the adapter is merged into the base model at
+                load time via PeftModel.from_pretrained() + merge_and_unload().
         """
         self.model_type = model_type
         self.trust_remote_code = trust_remote_code
+        self.lora_adapter_path = lora_adapter_path
+        self.last_detections: List[dict] = []
         self.previous_goal_heading = None  # Track previous heading for u=0 case
         super().__init__(model_path or "Qwen/Qwen3-VL-8B-Instruct", device)
     
@@ -202,16 +216,35 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
             
             # Load model with Qwen3VL's native class
             print(f"Loading model onto {self.device}...")
+            is_cuda = self.device == "cuda" or self.device.startswith("cuda:")
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_path,
                 trust_remote_code=self.trust_remote_code,
-                torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
-                device_map="auto" if self.device == "cuda" else "cpu"
+                torch_dtype=torch.bfloat16 if is_cuda else torch.float32,
+                device_map={"": self.device} if is_cuda else "cpu"
             )
             
             self.model.eval()
             print(f"Model loaded successfully!")
-            
+
+            # Optionally merge LoRA adapter
+            if self.lora_adapter_path is not None:
+                try:
+                    from peft import PeftModel
+                    print(f"Loading LoRA adapter from: {self.lora_adapter_path}")
+                    self.model = PeftModel.from_pretrained(self.model, self.lora_adapter_path)
+                    self.model = self.model.merge_and_unload()
+                    self.model.eval()
+                    print("LoRA adapter merged successfully.")
+                except ImportError:
+                    raise ImportError(
+                        "peft is required for LoRA inference. Install with: pip install peft"
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to load LoRA adapter from {self.lora_adapter_path}: {e}"
+                    )
+
         except ImportError as e:
             print(f"ERROR: Required library not found. Install with: pip install transformers qwen-vl-utils")
             print(f"Error details: {e}")
@@ -288,7 +321,7 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         )
         
         # Move to device
-        if self.device == "cuda":
+        if self.device == "cuda" or self.device.startswith("cuda:"):
             inputs = inputs.to(self.device)
         
         # Generate response
@@ -385,49 +418,151 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
             goal['heading'] = absolute_heading
 
         return goal
-    
+
+    def parse_detections_response(self, response: str) -> List[dict]:
+        """
+        Parse a JSON array of detections from the finetuned model's response.
+
+        Expects format: [{"bbox": [x1, y1, x2, y2], "label": "..."}, ...]
+
+        Returns:
+            List of validated detection dicts. Returns [] on any parse failure.
+        """
+        detections = None
+
+        # Try direct parse first
+        try:
+            detections = json.loads(response.strip())
+        except json.JSONDecodeError:
+            # Try to extract a JSON array substring via regex
+            match = re.search(r"\[.*\]", response, re.DOTALL)
+            if match:
+                try:
+                    detections = json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if detections is None or not isinstance(detections, list):
+            print(
+                f"WARNING: Failed to parse detection response: {response[:200]}"
+            )
+            return []
+
+        # Validate each item
+        validated = []
+        for item in detections:
+            if not isinstance(item, dict):
+                print(f"WARNING: Detection item is not a dict: {item}")
+                continue
+            bbox = item.get("bbox")
+            label = item.get("label")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                print(f"WARNING: Malformed bbox in detection: {item}")
+                continue
+            if not isinstance(label, str):
+                print(f"WARNING: Missing or non-string label in detection: {item}")
+                continue
+            validated.append({"bbox": [int(v) for v in bbox], "label": label})
+
+        return validated
+
     def predict_goal(self, frame: np.ndarray, prompt: Optional[str] = None, current_heading: float = 0.0) -> Dict[str, float]:
         """
         Predict navigation goal from visual observation using Qwen3-VL.
-        
+
+        When ``lora_adapter_path`` is set, uses the multi-object DETECTION_PROMPT,
+        parses ALL detected objects, stores them in ``self.last_detections``, and
+        steers toward the first detected object using the standard u-based formula.
+
+        When no LoRA adapter is loaded, uses the existing red-disk detection logic
+        (unchanged from the original implementation).
+
         Args:
             frame: Environment frame (H, W, C)
             prompt: Text prompt to guide prediction
             current_heading: Current robot heading in radians (yaw angle)
-            
+
         Returns:
             Dictionary with goal parameters (including absolute and relative heading)
         """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
-        
+
         # Preprocess frame
         image = self.preprocess_frame(frame)
-        
-        # Default prompt if none provided
+
+        # LoRA path: multi-object detection
+        if self.lora_adapter_path is not None:
+            if prompt is None:
+                from vlmrl.vlm.finetune.dataset import DETECTION_PROMPT
+                prompt = DETECTION_PROMPT
+
+            response = self.query_model(image, prompt)
+            print("*" * 50)
+            print(f"VLM Response (LoRA): {response}")
+
+            # Parse all detections; store on self for downstream consumers
+            self.last_detections = self.parse_detections_response(response)
+            print(f"Detections parsed: {len(self.last_detections)} object(s)")
+
+            if not self.last_detections:
+                print("No objects detected — stopping")
+                goal = {
+                    "vel_x": 0.0,
+                    "vel_y": 0.0,
+                    "heading": current_heading,
+                    "relative_heading": 0.0,
+                    "stop": True,
+                }
+            else:
+                # Steer toward the first detected object's bbox center
+                first_bbox = self.last_detections[0]["bbox"]  # [x1, y1, x2, y2]
+                x1, y1, x2, y2 = first_bbox
+                cx = (x1 + x2) / 2.0
+                u = np.clip((cx - 500.0) / 500.0, -1.0, 1.0)
+                relative_heading_radians = -u * 45.0 * np.pi / 180.0
+                absolute_heading = current_heading + relative_heading_radians
+                goal = {
+                    "vel_x": 1.0,
+                    "vel_y": 0.0,
+                    "heading": absolute_heading,
+                    "relative_heading": relative_heading_radians,
+                    "stop": False,
+                }
+                print(f"Steering toward '{self.last_detections[0]['label']}' bbox={first_bbox} u={u:.3f}")
+
+            print(f"Parsed Goal: {goal}")
+            print("*" * 50)
+
+            if "heading" in goal:
+                self.previous_goal_heading = goal["heading"]
+
+            return goal
+
+        # Original path: red-disk detection (no LoRA)
         if prompt is None:
             prompt = (
                 "Locate the red circular disk on the ground in this image. "
                 "Output its bounding box. "
                 "If no red disk is visible, output \"not visible\"."
             )
-        
+
         # Query model
         response = self.query_model(image, prompt)
         print("*" * 50)
         print(f"Prompt: {prompt}")
         print(f"VLM Response: {response}")
-        
+
         # Parse response to goal
         goal = self.parse_response_to_goal(response, current_heading=current_heading)
 
         print(f"Parsed Goal: {goal}")
         print("*" * 50)
-        
+
         # Store current goal heading for next prediction
-        if 'heading' in goal:
-            self.previous_goal_heading = goal['heading']
-        
+        if "heading" in goal:
+            self.previous_goal_heading = goal["heading"]
+
         return goal
 
 
