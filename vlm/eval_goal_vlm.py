@@ -36,7 +36,22 @@ def main():
     parser.add_argument('--lora_adapter_path', type=str, default=None,
                         help='Path to LoRA adapter directory. If provided, loads finetuned LoRA weights '
                              'and uses the multi-object detection prompt.')
-    
+    parser.add_argument(
+        '--predictor_type',
+        type=str,
+        default='huggingface',
+        choices=['huggingface', 'twopass'],
+        help='VLM predictor type to use: "huggingface" (default, single-pass) '
+             'or "twopass" (two-pass with obstruction awareness).'
+    )
+    parser.add_argument(
+        '--target_object',
+        type=str,
+        default='red disk marker',
+        help='Name of the target object for the two-pass predictor (default: "red disk marker"). '
+             'Used only when --predictor_type is "twopass".'
+    )
+
     # Environment configuration
     parser.add_argument('--use_mujoco', action='store_true',
                         help='Use MuJoCo backend (default: Mjx)')
@@ -62,13 +77,24 @@ def main():
     
     # Create Qwen3-VL predictor
     print(f"\nInitializing Qwen3-VL-8B-Instruct predictor on {args.vlm_device}...")
-    vlm_predictor = create_vlm_predictor(
-        'huggingface',
-        device=args.vlm_device,
-        trust_remote_code=args.trust_remote_code,
-        lora_adapter_path=args.lora_adapter_path,
-    )
-    print(f"Model: Qwen/Qwen3-VL-8B-Instruct (device: {args.vlm_device})")
+    if args.predictor_type == 'twopass' and args.lora_adapter_path is not None:
+        print("WARNING: --lora_adapter_path is ignored when --predictor_type is 'twopass'.")
+    if args.predictor_type == 'twopass':
+        vlm_predictor = create_vlm_predictor(
+            'twopass',
+            device=args.vlm_device,
+            trust_remote_code=args.trust_remote_code,
+            target_object=args.target_object,
+        )
+    else:
+        # 'huggingface' (default) — unchanged behavior
+        vlm_predictor = create_vlm_predictor(
+            'huggingface',
+            device=args.vlm_device,
+            trust_remote_code=args.trust_remote_code,
+            lora_adapter_path=args.lora_adapter_path,
+        )
+    print(f"Predictor: {args.predictor_type} | Model: Qwen/Qwen3-VL-8B-Instruct (device: {args.vlm_device})")
     
     # Create environment
     print(f"\nSetting up environment...")
@@ -86,6 +112,9 @@ def main():
     print("="*60)
     print(f"Agent: {args.agent_path}")
     print(f"VLM Model: Qwen/Qwen3-VL-8B-Instruct (device: {args.vlm_device})")
+    print(f"Predictor Type: {args.predictor_type}")
+    if args.predictor_type == 'twopass':
+        print(f"Target Object: {args.target_object}")
     print(f"Update Frequency: Every {args.vlm_update_freq} steps")
     if args.lora_adapter_path:
         print(f"LoRA Adapter: {args.lora_adapter_path}")

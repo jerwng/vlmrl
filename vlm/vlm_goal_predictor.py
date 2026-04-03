@@ -1,7 +1,7 @@
 """
 VLM Goal Predictor for Go2 Robot
 Processes environment frames and predicts navigation goals (heading, velocity)
-Uses Qwen/Qwen3-VL-8B-Instruct
+Uses Qwen/Qwen3.5-9B
 """
 import json
 import re
@@ -10,6 +10,52 @@ import numpy as np
 import torch
 from PIL import Image
 from typing import Dict, List, Optional, Tuple, Any
+
+
+SCENE_UNDERSTANDING_PROMPT = (
+    "You are guiding a robot toward the {target}.\n\n"
+    "Determine:\n"
+    "1. Is the {target} visible?\n"
+    "2. Is any object blocking the center path?\n"
+    "Return only JSON:\n"
+    "{{\n"
+    '  "target_visible": true or false,\n'
+    '  "blocking_object_present": true or false,\n'
+    "}}"
+)
+
+STEERING_PROMPT_TEMPLATE = (
+    "You are guiding a robot toward the {target}.\n\n"
+    "The direct path to the {target} is clear.\n\n"
+    "Output a normalized heading change in [-1, 1] to steer toward the center of the {target}.\n\n"
+    "Definition:\n"
+    "- negative = turn left\n"
+    "- positive = turn right\n"
+    "- 0 = go straight\n"
+    "- magnitude = how strong the turn should be\n\n"
+    "Return only JSON:\n"
+    '{{"heading_change": heading change value between -1 and 1}}'
+)
+
+AVOIDANCE_PROMPT_TEMPLATE = (
+    "You are guiding a robot toward the {target}.\n\n"
+    "The direct path to the {target} is blocked.\n\n"
+    "Choose the safer direction to go around the blocking object and output a normalized "
+    "heading change in [-1, 1].\n\n"
+    "Rules:\n"
+    "- Choose the safer side to avoid the blocking object.\n"
+    "- Use the smallest heading change that is likely to safely go around the obstacle.\n"
+    "- Do not use a large turn unless a small turn would likely fail.\n"
+    "Definition:\n"
+    "- negative = turn left\n"
+    "- positive = turn right\n"
+    "- larger magnitude = stronger turn\n\n"
+    "Return only JSON:\n"
+    '{{ "heading_change": heading change value between -1 and 1}}'
+)
+
+
+STOP_AREA_THRESHOLD = 0.10
 
 
 class VLMGoalPredictor:
@@ -160,23 +206,24 @@ class DummyVLMPredictor(VLMGoalPredictor):
 
 class HuggingFaceVLMPredictor(VLMGoalPredictor):
     """
-    Qwen3-VL-8B-Instruct goal predictor.
-    Hard-coded to use Qwen/Qwen3-VL-8B-Instruct.
+    Qwen3.5-9B goal predictor.
+    Hard-coded to use Qwen/Qwen3.5-9B (text-only model).
 
     Optionally loads a LoRA adapter via ``lora_adapter_path``.
     When a LoRA adapter is loaded, the predictor uses the multi-object
     detection prompt (DETECTION_PROMPT) and exposes all detected objects
     via ``self.last_detections`` after each ``predict_goal()`` call.
-    """
+
+"""
 
     def __init__(self, model_path: str = None, device: str = "cuda",
                  model_type: str = "auto", trust_remote_code: bool = True,
                  lora_adapter_path: Optional[str] = None):
         """
-        Initialize Qwen3-VL predictor.
+        Initialize Qwen3.5-9B predictor.
 
         Args:
-            model_path: Ignored (always uses Qwen/Qwen3-VL-8B-Instruct)
+            model_path: Ignored (always uses Qwen/Qwen3.5-9B)
             device: Device to run inference on ('cuda' or 'cpu')
             model_type: Ignored (kept for compatibility)
             trust_remote_code: Whether to trust remote code
@@ -189,41 +236,42 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         self.lora_adapter_path = lora_adapter_path
         self.last_detections: List[dict] = []
         self.previous_goal_heading = None  # Track previous heading for u=0 case
-        super().__init__(model_path or "Qwen/Qwen3-VL-8B-Instruct", device)
-    
+        super().__init__(model_path or "Qwen/Qwen3.5-9B", device)
+
     def load_model(self, model_path: str):
         """
-        Load Qwen3-VL-8B-Instruct model and processor.
-        
+        Load Qwen3.5-9B model and tokenizer.
+
         Args:
-            model_path: Ignored, using hard-coded Qwen/Qwen3-VL-8B-Instruct
+            model_path: Ignored, using hard-coded Qwen/Qwen3.5-9B
         """
         # Hard-coded model path
-        model_path = "Qwen/Qwen3-VL-8B-Instruct"
+        model_path = "Qwen/Qwen3.5-9B"
         self.model_path = model_path
-        
-        print(f"Loading Qwen3-VL model: {model_path}")
-        
+
+        print(f"Loading Qwen3.5-9B model: {model_path}")
+
         try:
-            from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-            
+            from transformers import AutoProcessor, AutoModelForImageTextToText
+
             # Load processor
             print("Loading processor...")
             self.processor = AutoProcessor.from_pretrained(
                 model_path,
                 trust_remote_code=self.trust_remote_code
+
             )
-            
-            # Load model with Qwen3VL's native class
+
+            # Load model
             print(f"Loading model onto {self.device}...")
             is_cuda = self.device == "cuda" or self.device.startswith("cuda:")
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+            self.model = AutoModelForImageTextToText.from_pretrained(
                 model_path,
                 trust_remote_code=self.trust_remote_code,
                 torch_dtype=torch.bfloat16 if is_cuda else torch.float32,
                 device_map={"": self.device} if is_cuda else "cpu"
             )
-            
+
             self.model.eval()
             print(f"Model loaded successfully!")
 
@@ -308,7 +356,8 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         
         # Prepare inputs
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, 
+            enable_thinking=False
         )
         image_inputs, video_inputs = process_vision_info(messages)
         
@@ -328,11 +377,13 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=64,
-                do_sample=False,
-                temperature=0.0,
-                top_p=1.0,
-                repetition_penalty=1.0
+                max_new_tokens=32768,
+                do_sample=True,
+                temperature=1.0,
+                top_p=0.95,
+                top_k=20,
+                min_p=0.0,
+                repetition_penalty=1.0,
             )
 
         generated_ids = [
@@ -342,6 +393,11 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         response = self.processor.batch_decode(
             generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
+
+        think_match = re.search(r'(.*?)</think>\n?', response, flags=re.DOTALL)
+        if think_match:
+            print(f"[VLM Thinking]: {think_match.group(1).strip()}")
+            response = response[think_match.end():].strip()
         
         return response
     
@@ -360,9 +416,6 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
             Goal dictionary with vel_x, vel_y, heading (absolute), relative_heading, stop
         """
         import re
-
-        # Area fraction of grounding coordinate space (1000x1000) that triggers stop
-        STOP_AREA_THRESHOLD = 0.10
 
         goal = {
             'vel_x': 1.0,
@@ -566,6 +619,148 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         return goal
 
 
+class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
+    """
+    Two-pass VLM predictor for goal-directed navigation.
+
+    Pass 1: Localize the target object via bounding box detection.
+    Pass 2: Predict a heading with obstruction awareness.
+
+    Inherits model loading, frame preprocessing, and query_model from
+    HuggingFaceVLMPredictor. Does not support LoRA adapters.
+    """
+
+    def __init__(self, target_object: str = "red disk marker",
+                 model_path: str = None, device: str = "cuda",
+                 model_type: str = "auto", trust_remote_code: bool = True):
+        # Explicitly pass lora_adapter_path=None to disable LoRA in parent
+        super().__init__(
+            model_path=model_path,
+            device=device,
+            model_type=model_type,
+            trust_remote_code=trust_remote_code,
+            lora_adapter_path=None,
+        )
+        self.target_object = target_object
+
+    def _parse_scene_response(self, response: str) -> Optional[dict]:
+        """Parse a Pass 1 scene understanding response.
+
+        Returns a dict with keys:
+            target_visible (bool),
+            blocking_object_present (bool)
+        or None on failure.
+        """
+        try:
+            result = json.loads(response.strip())
+            if isinstance(result, dict):
+                return {
+                    "target_visible": bool(result.get("target_visible", False)),
+                    "blocking_object_present": bool(result.get("blocking_object_present", False)),
+                }
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        # Regex fallback
+        vis_match = re.search(r'"target_visible"\s*:\s*(true|false)', response, re.IGNORECASE)
+        blk_match = re.search(r'"blocking_object_present"\s*:\s*(true|false)', response, re.IGNORECASE)
+        if vis_match and blk_match:
+            return {
+                "target_visible": (vis_match.group(1).lower() == "true"),
+                "blocking_object_present": (blk_match.group(1).lower() == "true")
+            }
+
+        print(f"WARNING: _parse_scene_response failed to parse: {response[:200]}")
+        return None
+
+    def _parse_heading_response(self, response: str) -> Optional[float]:
+        """Parse a Pass 2 response into (heading_change_float, avoid_direction_str) or (None, "left")."""
+        try:
+            result = json.loads(response.strip())
+            if isinstance(result, dict) and "heading_change" in result:
+                heading = float(np.clip(float(result["heading_change"]), -1.0, 1.0))
+                return heading
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        # Regex fallback
+        h_match = re.search(r'"heading_change"\s*:\s*(-?[0-9]*\.?[0-9]+)', response)
+        if h_match:
+            heading = float(np.clip(float(h_match.group(1)), -1.0, 1.0))
+            return heading
+
+        print(f"WARNING: _parse_heading_response failed to parse: {response[:200]}")
+        return  None
+
+    def predict_goal(self, frame: np.ndarray, prompt: Optional[str] = None,
+                     current_heading: float = 0.0) -> Dict[str, Any]:
+        """
+        Run the two-pass VLM pipeline and return a goal dict with keys:
+        vel_x, vel_y, heading, relative_heading, stop, obstructed.
+        """
+        import time
+
+        image = self.preprocess_frame(frame)
+
+        # ---- Pass 1: Scene Understanding ----
+        t0 = time.time()
+        pass1_response = self.query_model(image, SCENE_UNDERSTANDING_PROMPT.format(target=self.target_object))
+        t1 = time.time()
+        print("*" * 50)
+        print(f"[Pass 1] Wall time: {t1 - t0:.2f}s")
+        print(f"[Pass 1 Response]: {pass1_response}")
+
+        scene = self._parse_scene_response(pass1_response)
+        print(f"[Pass 1 Scene]: {scene}")
+
+        if scene is None or not scene["target_visible"]:
+            print("[Pass 1] Target not visible — stopping")
+            goal = {
+                "vel_x": 0.0, "vel_y": 0.0,
+                "heading": current_heading, "relative_heading": 0.0,
+                "stop": True, "obstructed": False,
+            }
+            print(f"[Final Goal]: {goal}")
+            print("*" * 50)
+            self.previous_goal_heading = current_heading
+            return goal
+
+        # ---- Pass 2: Heading Prediction ----
+        if not scene["blocking_object_present"]:
+            pass2_prompt = STEERING_PROMPT_TEMPLATE.format(target=self.target_object)
+        else:
+            pass2_prompt = AVOIDANCE_PROMPT_TEMPLATE.format(target=self.target_object)
+        t2 = time.time()
+        pass2_response = self.query_model(image, pass2_prompt)
+        t3 = time.time()
+        print(f"[Pass 2] Wall time: {t3 - t2:.2f}s")
+        print(f"[Pass 2 Response]: {pass2_response}")
+
+        heading_raw = self._parse_heading_response(pass2_response)
+        print(f"[Pass 2 Heading]: {heading_raw}")
+
+        # Dead-zone
+        if abs(heading_raw) < 0.1:
+            heading_raw = 0.0
+
+        relative_heading_radians = -heading_raw * 45.0 * np.pi / 180.0
+        absolute_heading = current_heading + relative_heading_radians
+
+        if heading_raw == 0.0 and self.previous_goal_heading is not None:
+            absolute_heading = self.previous_goal_heading
+
+        goal = {
+            "vel_x": 1.0, "vel_y": 0.0,
+            "heading": absolute_heading,
+            "relative_heading": relative_heading_radians,
+            "stop": False,
+        }
+        print(f"[Final Goal]: {goal}")
+        print("*" * 50)
+        self.previous_goal_heading = absolute_heading
+        return goal
+
+
 class OpenVLAGoalPredictor(VLMGoalPredictor):
     """
     OpenVLA-based goal predictor (kept for compatibility).
@@ -596,29 +791,39 @@ class OpenVLAGoalPredictor(VLMGoalPredictor):
 def create_vlm_predictor(predictor_type: str = "dummy", **kwargs) -> VLMGoalPredictor:
     """
     Factory function to create VLM predictors.
-    
+
     Args:
-        predictor_type: Type of predictor ('dummy', 'huggingface', 'hf')
+        predictor_type: Type of predictor ('dummy', 'huggingface', 'hf', 'twopass', 'openvla')
         **kwargs: Additional arguments for predictor initialization
-            - model_path: Ignored for 'huggingface' (always uses Qwen3-VL-8B-Instruct)
+            - model_path: Ignored for 'huggingface'/'twopass' (always uses Qwen3-VL-8B-Instruct)
             - device: 'cuda' or 'cpu' (default: 'cuda')
             - trust_remote_code: Trust remote code (default: True)
-        
+            - target_object: str (default: 'red disk marker') — used only with 'twopass'
+
     Returns:
         VLMGoalPredictor instance
-        
+
     Examples:
         # Dummy predictor for testing
         predictor = create_vlm_predictor('dummy')
-        
-        # Qwen3-VL-8B-Instruct
+
+        # Qwen3-VL-8B-Instruct (single-pass)
         predictor = create_vlm_predictor('huggingface', device='cuda')
+
+        # Two-pass predictor with configurable target
+        predictor = create_vlm_predictor('twopass', device='cuda', target_object='red disk marker')
     """
     if predictor_type == "dummy":
         return DummyVLMPredictor(**kwargs)
     elif predictor_type in ["huggingface", "hf"]:
         return HuggingFaceVLMPredictor(**kwargs)
+    elif predictor_type == "twopass":
+        target_object = kwargs.pop("target_object", "red disk marker")
+        return TwoPassVLMPredictor(target_object=target_object, **kwargs)
     elif predictor_type == "openvla":
         return OpenVLAGoalPredictor(**kwargs)
     else:
-        raise ValueError(f"Unknown predictor type: {predictor_type}. Choose from: dummy, huggingface")
+        raise ValueError(
+            f"Unknown predictor type: {predictor_type}. "
+            "Choose from: dummy, huggingface, hf, twopass, openvla"
+        )
