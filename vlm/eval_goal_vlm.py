@@ -59,6 +59,18 @@ def main():
                         help='Run in headless mode')
     parser.add_argument('--n_steps', type=int, default=1000,
                         help='Number of steps to run')
+    parser.add_argument('--low_velocity_threshold', type=float, default=0.1,
+                        help='Terminate when average planar speed over the recent window drops below this value')
+    parser.add_argument('--low_velocity_window', type=int, default=100,
+                        help='Window size in steps for low-velocity termination; set to 0 to disable')
+
+    # Episode evaluation parameters
+    parser.add_argument('--target_body_name', type=str, default='red_disk_marker',
+                        help='Name of the target body in the MuJoCo model for success distance check (default: red_disk_marker)')
+    parser.add_argument('--success_distance', type=float, default=1.0,
+                        help='Max distance (m) from target body to count as success (default: 1.0)')
+    parser.add_argument('--success_velocity', type=float, default=0.1,
+                        help='Max planar speed (m/s) at termination to count as success (default: 0.1)')
     
     # Other options
     parser.add_argument('--deterministic', action='store_true',
@@ -126,6 +138,10 @@ def main():
         print("Using default prompt (requests JSON with red disk analysis)")
     print(f"Backend: {'MuJoCo' if args.use_mujoco else 'Mjx'}")
     print(f"Steps: {args.n_steps}")
+    if args.low_velocity_window > 0:
+        print(f"Low-Velocity Stop: avg planar speed < {args.low_velocity_threshold} for {args.low_velocity_window} steps")
+    else:
+        print("Low-Velocity Stop: disabled")
     print(f"Mode: {'Headless' if args.headless else 'GUI'}")
     print("="*60 + "\n")
     
@@ -143,7 +159,12 @@ def main():
             rng=rng,
             vlm_predictor=vlm_predictor,
             vlm_update_frequency=args.vlm_update_freq,
-            vlm_prompt=args.vlm_prompt
+            vlm_prompt=args.vlm_prompt,
+            low_velocity_threshold=args.low_velocity_threshold if args.low_velocity_window > 0 else None,
+            low_velocity_window=args.low_velocity_window,
+            target_body_name=args.target_body_name,
+            success_distance_threshold=args.success_distance,
+            success_velocity_threshold=args.success_velocity,
         )
     else:
         PPOJaxCollectVLMRL.play_policy(
@@ -155,7 +176,12 @@ def main():
             rng=rng,
             vlm_predictor=vlm_predictor,
             vlm_update_frequency=args.vlm_update_freq,
-            vlm_prompt=args.vlm_prompt
+            vlm_prompt=args.vlm_prompt,
+            low_velocity_threshold=args.low_velocity_threshold if args.low_velocity_window > 0 else None,
+            low_velocity_window=args.low_velocity_window,
+            target_body_name=args.target_body_name,
+            success_distance_threshold=args.success_distance,
+            success_velocity_threshold=args.success_velocity,
         )
     
     print("\nQwen3-VL guided navigation complete!")

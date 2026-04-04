@@ -17,24 +17,26 @@ SCENE_UNDERSTANDING_PROMPT = (
     "Determine:\n"
     "1. Is the {target} visible?\n"
     "2. Is any object blocking the center path?\n"
-    "Return only JSON:\n"
-    "{{\n"
-    '  "target_visible": true or false,\n'
-    '  "blocking_object_present": true or false,\n'
-    "}}"
+    "Return only JSON.\n"
+    "Example valid outputs:\n"
+    '{{"target_visible": true, "blocking_object_present": false}}\n'
+    '{{"target_visible": false, "blocking_object_present": false}}\n'
 )
 
 STEERING_PROMPT_TEMPLATE = (
     "You are guiding a robot toward the {target}.\n\n"
     "The direct path to the {target} is clear.\n\n"
-    "Output a normalized heading change in [-1, 1] to steer toward the center of the {target}.\n\n"
+    "Calculate a normalized heading change in [-1, 1] to steer toward the center of the {target}.\n\n"
     "Definition:\n"
     "- negative = turn left\n"
     "- positive = turn right\n"
     "- 0 = go straight\n"
     "- magnitude = how strong the turn should be\n\n"
-    "Return only JSON:\n"
-    '{{"heading_change": heading change value between -1 and 1}}'
+    "Return only JSON.\n"
+    "Example valid outputs:\n"
+    '{{"heading_change": -0.55}}\n'
+    '{{"heading_change": 0.30}}\n'
+    '{{"heading_change": 0.70}}\n'
 )
 
 AVOIDANCE_PROMPT_TEMPLATE = (
@@ -51,11 +53,25 @@ AVOIDANCE_PROMPT_TEMPLATE = (
     "- positive = turn right\n"
     "- larger magnitude = stronger turn\n\n"
     "Return only JSON:\n"
-    '{{ "heading_change": heading change value between -1 and 1}}'
+    "Example valid outputs:\n"
+    '{{"heading_change": -0.55}}\n'
+    '{{"heading_change": 0.30}}\n'
+    '{{"heading_change": 0.70}}\n'
 )
 
+STOP_PROMPT_TEMPLATE = (
+    "You are guiding a robot toward the {target}.\n\n"
+    "Current robot state:\n"
+    "- stopping_distance_m: {stopping_distance_m}\n\n"
+    "Task:\n"
+    "Should the robot start stopping now so that it stops before reaching the {target}?\n\n"
+    "Use the image to judge how close the {target} appears.\n"
+    "Return true only if the {target} appears close enough that continuing forward would likely prevent the robot from stopping before reaching it.\n"
+    "Return false otherwise.\n\n"
+    'Return exactly one JSON object: {{"stop_now": true}} or {{"stop_now": false}}'
+)
 
-STOP_AREA_THRESHOLD = 0.10
+STOP_AREA_THRESHOLD = 0.50
 
 
 class VLMGoalPredictor:
@@ -630,6 +646,9 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
     HuggingFaceVLMPredictor. Does not support LoRA adapters.
     """
 
+    # Assumed deceleration (m/s^2) used to estimate stopping distance
+    _DECEL_MPS2 = 0.25
+
     def __init__(self, target_object: str = "red disk marker",
                  model_path: str = None, device: str = "cuda",
                  model_type: str = "auto", trust_remote_code: bool = True):
@@ -692,11 +711,45 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         print(f"WARNING: _parse_heading_response failed to parse: {response[:200]}")
         return  None
 
-    def predict_goal(self, frame: np.ndarray, prompt: Optional[str] = None,
-                     current_heading: float = 0.0) -> Dict[str, Any]:
+    def _parse_stop_response(self, response: str) -> bool:
+        """Parse a Pass 3 stop response into a boolean.
+
+        Returns True if stop_now is true, False otherwise.
+        Defaults to False on parse failure.
         """
-        Run the two-pass VLM pipeline and return a goal dict with keys:
+        try:
+            result = json.loads(response.strip())
+            if isinstance(result, dict) and "stop_now" in result:
+                return bool(result["stop_now"])
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        # Regex fallback
+        match = re.search(r'"stop_now"\s*:\s*(true|false)', response, re.IGNORECASE)
+        if match:
+            return match.group(1).lower() == "true"
+
+        print(f"WARNING: _parse_stop_response failed to parse: {response[:200]}")
+        return False
+
+    def predict_goal(self, frame: np.ndarray, prompt: Optional[str] = None,
+                     current_heading: float = 0.0,
+                     velocity_toward_target_mps: float = 0.0) -> Dict[str, Any]:
+        """
+        Run the three-pass VLM pipeline and return a goal dict with keys:
         vel_x, vel_y, heading, relative_heading, stop, obstructed.
+
+        Pass 1: Scene understanding (target visible? path blocked?)
+        Pass 2: Heading prediction (steer or avoid)
+        Pass 3: Stop check — uses current robot velocity from MuJoCo to estimate
+                stopping distance and ask VLM whether to stop now.
+
+        Args:
+            frame: Egocentric camera frame (H, W, C).
+            prompt: Unused (kept for interface compatibility).
+            current_heading: Current robot yaw in radians.
+            velocity_toward_target_mps: Planar speed of the robot in m/s,
+                obtained from MuJoCo qvel. Used to compute stopping distance.
         """
         import time
 
@@ -749,8 +802,50 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         if heading_raw == 0.0 and self.previous_goal_heading is not None:
             absolute_heading = self.previous_goal_heading
 
+        if scene["blocking_object_present"]:
+            vel_x = 1.0 - 0.65 * abs(heading_raw)
+            print(f"[Blocking] Scaling vel_x: 1.0 - 0.65 * {abs(heading_raw):.3f} = {vel_x:.3f}")
+        else:
+            vel_x = 1.0
+
+        # ---- Pass 3: Stop Check ----
+        estimated_stopping_distance_m = round(
+            velocity_toward_target_mps ** 2 / (2.0 * self._DECEL_MPS2), 2
+        )
+        print(
+            f"[Pass 3] velocity={velocity_toward_target_mps:.2f} m/s  "
+            f"stopping_distance={estimated_stopping_distance_m:.2f} m"
+        )
+        t4 = time.time()
+        pass3_response = self.query_model(
+            image,
+            STOP_PROMPT_TEMPLATE.format(
+                target=self.target_object,
+                stopping_distance_m=estimated_stopping_distance_m,
+            ),
+        )
+        t5 = time.time()
+        print(f"[Pass 3] Wall time: {t5 - t4:.2f}s")
+        print(f"[Pass 3 Response]: {pass3_response}")
+
+        should_stop = self._parse_stop_response(pass3_response)
+        print(f"[Pass 3 Stop]: {should_stop}")
+
+        if should_stop:
+            print("[Pass 3] Target near — zeroing velocity, holding heading")
+            goal = {
+                "vel_x": 0.0, "vel_y": 0.0,
+                "heading": current_heading,
+                "relative_heading": 0.0,
+                "stop": True,
+            }
+            print(f"[Final Goal]: {goal}")
+            print("*" * 50)
+            self.previous_goal_heading = current_heading
+            return goal
+
         goal = {
-            "vel_x": 1.0, "vel_y": 0.0,
+            "vel_x": vel_x, "vel_y": 0.0,
             "heading": absolute_heading,
             "relative_heading": relative_heading_radians,
             "stop": False,
@@ -810,7 +905,7 @@ def create_vlm_predictor(predictor_type: str = "dummy", **kwargs) -> VLMGoalPred
         # Qwen3-VL-8B-Instruct (single-pass)
         predictor = create_vlm_predictor('huggingface', device='cuda')
 
-        # Two-pass predictor with configurable target
+        # Three-pass predictor with configurable target
         predictor = create_vlm_predictor('twopass', device='cuda', target_object='red disk marker')
     """
     if predictor_type == "dummy":
