@@ -11,16 +11,16 @@ import torch
 from PIL import Image
 from typing import Dict, List, Optional, Tuple, Any
 
-
 SCENE_UNDERSTANDING_PROMPT = (
     "You are guiding a robot toward the {target}.\n\n"
     "Determine:\n"
     "1. Is the {target} visible?\n"
     "2. Is any object blocking the center path?\n"
-    "Return only JSON.\n"
-    "Example valid outputs:\n"
-    '{{"target_visible": true, "blocking_object_present": false}}\n'
-    '{{"target_visible": false, "blocking_object_present": false}}\n'
+    "Return only JSON:\n"
+    "{{\n"
+    '  "target_visible": true or false,\n'
+    '  "blocking_object_present": true or false,\n'
+    "}}"
 )
 
 STEERING_PROMPT_TEMPLATE = (
@@ -32,11 +32,8 @@ STEERING_PROMPT_TEMPLATE = (
     "- positive = turn right\n"
     "- 0 = go straight\n"
     "- magnitude = how strong the turn should be\n\n"
-    "Return only JSON.\n"
-    "Example valid outputs:\n"
-    '{{"heading_change": -0.55}}\n'
-    '{{"heading_change": 0.30}}\n'
-    '{{"heading_change": 0.70}}\n'
+    "Return only JSON:\n"
+    '{{"heading_change": heading change value between -1 and 1}}'
 )
 
 AVOIDANCE_PROMPT_TEMPLATE = (
@@ -53,25 +50,18 @@ AVOIDANCE_PROMPT_TEMPLATE = (
     "- positive = turn right\n"
     "- larger magnitude = stronger turn\n\n"
     "Return only JSON:\n"
-    "Example valid outputs:\n"
-    '{{"heading_change": -0.55}}\n'
-    '{{"heading_change": 0.30}}\n'
-    '{{"heading_change": 0.70}}\n'
+    '{{ "heading_change": heading change value between -1 and 1}}'
 )
 
 STOP_PROMPT_TEMPLATE = (
     "You are guiding a robot toward the {target}.\n\n"
-    "Current robot state:\n"
-    "- stopping_distance_m: {stopping_distance_m}\n\n"
-    "Task:\n"
-    "Should the robot start stopping now so that it stops before reaching the {target}?\n\n"
-    "Use the image to judge how close the {target} appears.\n"
-    "Return true only if the {target} appears close enough that continuing forward would likely prevent the robot from stopping before reaching it.\n"
-    "Return false otherwise.\n\n"
-    'Return exactly one JSON object: {{"stop_now": true}} or {{"stop_now": false}}'
+    "The {target} is visible and the path is clear.\n\n"
+    "Locate the {target} in the image and output its bounding box as "
+    "[x1, y1, x2, y2] in a 0–1000 coordinate grid (top-left origin).\n\n"
+    "Return only JSON:\n"
+    '{{"target_bbox": [x1, y1, x2, y2]}}'
 )
-
-STOP_AREA_THRESHOLD = 0.50
+STOP_BOTTOM_THRESHOLD = 0.85  # stop when bbox bottom >= this fraction of image height
 
 
 class VLMGoalPredictor:
@@ -461,10 +451,10 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         u = np.clip(u, -1.0, 1.0)
 
         # Compute bbox area fraction to decide stop
-        area_fraction = (x2 - x1) * (y2 - y1) / 1_000_000.0
-        print(f"Bbox area fraction: {area_fraction:.4f} (threshold={STOP_AREA_THRESHOLD})")
+        bottom_fraction = y2 / 1000.0
+        print(f"Bbox bottom fraction: {bottom_fraction:.4f} (threshold={STOP_BOTTOM_THRESHOLD})")
 
-        if area_fraction >= STOP_AREA_THRESHOLD:
+        if bottom_fraction >= STOP_BOTTOM_THRESHOLD:
             print("Red disk is NEAR (large bbox) — signaling STOP")
             goal['vel_x'] = 0.0
             goal['vel_y'] = 0.0
@@ -711,45 +701,42 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         print(f"WARNING: _parse_heading_response failed to parse: {response[:200]}")
         return  None
 
-    def _parse_stop_response(self, response: str) -> bool:
-        """Parse a Pass 3 stop response into a boolean.
+    def _parse_stop_response(self, response: str) -> Optional[Tuple[int, int, int, int]]:
+        """Parse a Pass 3 stop response into a bbox tuple (x1, y1, x2, y2) or None.
 
-        Returns True if stop_now is true, False otherwise.
-        Defaults to False on parse failure.
+        Returns the bounding box if successfully parsed, None on failure.
         """
         try:
             result = json.loads(response.strip())
-            if isinstance(result, dict) and "stop_now" in result:
-                return bool(result["stop_now"])
+            if isinstance(result, dict):
+                bbox = result.get("target_bbox")
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    return tuple(int(v) for v in bbox)
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
         # Regex fallback
-        match = re.search(r'"stop_now"\s*:\s*(true|false)', response, re.IGNORECASE)
+        match = re.search(r'"target_bbox"\s*:\s*\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]', response)
         if match:
-            return match.group(1).lower() == "true"
+            return tuple(int(match.group(i)) for i in range(1, 5))
 
-        print(f"WARNING: _parse_stop_response failed to parse: {response[:200]}")
-        return False
+        print(f"WARNING: _parse_stop_response failed to parse bbox: {response[:200]}")
+        return None
 
     def predict_goal(self, frame: np.ndarray, prompt: Optional[str] = None,
-                     current_heading: float = 0.0,
-                     velocity_toward_target_mps: float = 0.0) -> Dict[str, Any]:
+                     current_heading: float = 0.0) -> Dict[str, Any]:
         """
         Run the three-pass VLM pipeline and return a goal dict with keys:
         vel_x, vel_y, heading, relative_heading, stop, obstructed.
 
         Pass 1: Scene understanding (target visible? path blocked?)
         Pass 2: Heading prediction (steer or avoid)
-        Pass 3: Stop check — uses current robot velocity from MuJoCo to estimate
-                stopping distance and ask VLM whether to stop now.
+        Pass 3: Stop check via bbox area fraction — only runs when path is NOT blocked.
 
         Args:
             frame: Egocentric camera frame (H, W, C).
             prompt: Unused (kept for interface compatibility).
             current_heading: Current robot yaw in radians.
-            velocity_toward_target_mps: Planar speed of the robot in m/s,
-                obtained from MuJoCo qvel. Used to compute stopping distance.
         """
         import time
 
@@ -808,27 +795,31 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         else:
             vel_x = 1.0
 
-        # ---- Pass 3: Stop Check ----
-        estimated_stopping_distance_m = round(
-            velocity_toward_target_mps ** 2 / (2.0 * self._DECEL_MPS2), 2
-        )
-        print(
-            f"[Pass 3] velocity={velocity_toward_target_mps:.2f} m/s  "
-            f"stopping_distance={estimated_stopping_distance_m:.2f} m"
-        )
-        t4 = time.time()
-        pass3_response = self.query_model(
-            image,
-            STOP_PROMPT_TEMPLATE.format(
-                target=self.target_object,
-                stopping_distance_m=estimated_stopping_distance_m,
-            ),
-        )
-        t5 = time.time()
-        print(f"[Pass 3] Wall time: {t5 - t4:.2f}s")
-        print(f"[Pass 3 Response]: {pass3_response}")
+        # ---- Pass 3: Stop Check (bbox area fraction) — unblocked path only ----
+        should_stop = False
+        if not scene["blocking_object_present"]:
+            t4 = time.time()
+            pass3_response = self.query_model(
+                image,
+                STOP_PROMPT_TEMPLATE.format(target=self.target_object),
+            )
+            t5 = time.time()
+            print(f"[Pass 3] Wall time: {t5 - t4:.2f}s")
+            print(f"[Pass 3 Response]: {pass3_response}")
 
-        should_stop = self._parse_stop_response(pass3_response)
+            stop_bbox = self._parse_stop_response(pass3_response)
+            print(f"[Pass 3 Bbox]: {stop_bbox}")
+
+            if stop_bbox is not None:
+                x1, y1, x2, y2 = stop_bbox
+                bottom_fraction = y2 / 1000.0
+                print(f"[Pass 3] Bbox bottom fraction: {bottom_fraction:.4f} (threshold={STOP_BOTTOM_THRESHOLD})")
+                should_stop = bottom_fraction >= STOP_BOTTOM_THRESHOLD
+            else:
+                print("[Pass 3] No bbox parsed — not stopping")
+        else:
+            print("[Pass 3] Skipped (path blocked — avoidance active)")
+
         print(f"[Pass 3 Stop]: {should_stop}")
 
         if should_stop:
