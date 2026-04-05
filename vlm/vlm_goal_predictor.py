@@ -14,14 +14,20 @@ from typing import Dict, List, Optional, Tuple, Any
 SCENE_UNDERSTANDING_PROMPT = (
     "You are guiding a robot toward the {target}.\n\n"
     "Determine:\n"
-    "1. Is the {target} visible?\n"
-    "2. Is any object blocking the center path?\n"
-    "Return only JSON:\n"
-    "{{\n"
-    '  "target_visible": true or false,\n'
-    '  "blocking_object_present": true or false,\n'
-    "}}"
+    "1. Is the {target} visible in the image?\n"
+    "2. If the {target} is visible, is there any other object between the robot and the {target} that blocks the direct path to it?\n\n"
+    "Important:\n"
+    "- Objects on the floor can block the path.\n"
+    "- Do not ignore low obstacles on the floor.\n"
+    "- A blocking object is any object the robot would likely collide with if it moved directly toward the {target}.\n\n"
+    "Return exactly one JSON object.\n"
+    "Do not output any explanation or extra text.\n"
+    "Example valid outputs:\n"
+    '{{"target_visible": true, "object_blocking": true}}\n'
+    '{{"target_visible": true, "object_blocking": false}}\n'
+    '{{"target_visible": false, "object_blocking": false}}\n'
 )
+
 
 STEERING_PROMPT_TEMPLATE = (
     "You are guiding a robot toward the {target}.\n\n"
@@ -39,19 +45,32 @@ STEERING_PROMPT_TEMPLATE = (
 AVOIDANCE_PROMPT_TEMPLATE = (
     "You are guiding a robot toward the {target}.\n\n"
     "The direct path to the {target} is blocked.\n\n"
-    "Choose the safer direction to go around the blocking object and output a normalized "
-    "heading change in [-1, 1].\n\n"
-    "Rules:\n"
-    "- Choose the safer side to avoid the blocking object.\n"
-    "- Use the smallest heading change that is likely to safely go around the obstacle.\n"
-    "- Do not use a large turn unless a small turn would likely fail.\n"
+    "Calculate a normalized heading change in [-1, 1] to steer toward the center of the {target}.\n\n"
     "Definition:\n"
     "- negative = turn left\n"
     "- positive = turn right\n"
-    "- larger magnitude = stronger turn\n\n"
+    "- 0 = go straight\n"
+    "- magnitude = how strong the turn should be\n\n"
     "Return only JSON:\n"
-    '{{ "heading_change": heading change value between -1 and 1}}'
+    '{{"heading_change": heading change value between -1 and 1}}'
 )
+
+# AVOIDANCE_PROMPT_TEMPLATE = (
+#     "You are guiding a robot toward the {target}.\n\n"
+#     "The direct path to the {target} is blocked.\n\n"
+#     "Choose the safer direction to go around the blocking object and output a normalized "
+#     "heading change in [-1, 1].\n\n"
+#     "Rules:\n"
+#     "- Choose the safer side to avoid the blocking object.\n"
+#     "- Use the smallest heading change that is likely to safely go around the obstacle.\n"
+#     "- Do not use a large turn unless a small turn would likely fail.\n"
+#     "Definition:\n"
+#     "- negative = turn left\n"
+#     "- positive = turn right\n"
+#     "- larger magnitude = stronger turn\n\n"
+#     "Return only JSON:\n"
+#     '{{ "heading_change": heading change value between -1 and 1}}'
+# )
 
 STOP_PROMPT_TEMPLATE = (
     "You are guiding a robot toward the {target}.\n\n"
@@ -59,9 +78,9 @@ STOP_PROMPT_TEMPLATE = (
     "Locate the {target} in the image and output its bounding box as "
     "[x1, y1, x2, y2] in a 0–1000 coordinate grid (top-left origin).\n\n"
     "Return only JSON:\n"
-    '{{"target_bbox": [x1, y1, x2, y2]}}'
+    '{{"bbox_2d": [x1, y1, x2, y2]}}'
 )
-STOP_BOTTOM_THRESHOLD = 0.85  # stop when bbox bottom >= this fraction of image height
+STOP_BOTTOM_THRESHOLD = 0.80  # stop when bbox bottom >= this fraction of image height
 
 
 class VLMGoalPredictor:
@@ -651,13 +670,15 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
             lora_adapter_path=None,
         )
         self.target_object = target_object
+        self.vlm_time_total = 0.0   # cumulative VLM inference wall time (seconds)
+        self.vlm_call_count = 0     # number of predict_goal calls
 
     def _parse_scene_response(self, response: str) -> Optional[dict]:
         """Parse a Pass 1 scene understanding response.
 
         Returns a dict with keys:
             target_visible (bool),
-            blocking_object_present (bool)
+            object_blocking (bool)
         or None on failure.
         """
         try:
@@ -665,18 +686,18 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
             if isinstance(result, dict):
                 return {
                     "target_visible": bool(result.get("target_visible", False)),
-                    "blocking_object_present": bool(result.get("blocking_object_present", False)),
+                    "object_blocking": bool(result.get("object_blocking", False)),
                 }
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
         # Regex fallback
         vis_match = re.search(r'"target_visible"\s*:\s*(true|false)', response, re.IGNORECASE)
-        blk_match = re.search(r'"blocking_object_present"\s*:\s*(true|false)', response, re.IGNORECASE)
+        blk_match = re.search(r'"object_blocking"\s*:\s*(true|false)', response, re.IGNORECASE)
         if vis_match and blk_match:
             return {
                 "target_visible": (vis_match.group(1).lower() == "true"),
-                "blocking_object_present": (blk_match.group(1).lower() == "true")
+                "object_blocking": (blk_match.group(1).lower() == "true")
             }
 
         print(f"WARNING: _parse_scene_response failed to parse: {response[:200]}")
@@ -709,14 +730,14 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         try:
             result = json.loads(response.strip())
             if isinstance(result, dict):
-                bbox = result.get("target_bbox")
+                bbox = result.get("bbox_2d")
                 if isinstance(bbox, list) and len(bbox) == 4:
                     return tuple(int(v) for v in bbox)
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
         # Regex fallback
-        match = re.search(r'"target_bbox"\s*:\s*\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]', response)
+        match = re.search(r'"bbox_2d"\s*:\s*\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]', response)
         if match:
             return tuple(int(match.group(i)) for i in range(1, 5))
 
@@ -740,21 +761,28 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         """
         import time
 
+        _N_SAMPLES = 3
         image = self.preprocess_frame(frame)
 
-        # ---- Pass 1: Scene Understanding ----
+        # ---- Pass 1: Scene Understanding (3 samples, majority vote) ----
         t0 = time.time()
-        pass1_response = self.query_model(image, SCENE_UNDERSTANDING_PROMPT.format(target=self.target_object))
+        pass1_prompt = SCENE_UNDERSTANDING_PROMPT.format(target=self.target_object)
+        pass1_scenes = []
+        for i in range(_N_SAMPLES):
+            resp = self.query_model(image, pass1_prompt)
+            parsed = self._parse_scene_response(resp)
+            print(f"[Pass 1 Sample {i+1}] Response: {resp}")
+            print(f"[Pass 1 Sample {i+1}] Parsed: {parsed}")
+            if parsed is not None:
+                pass1_scenes.append(parsed)
         t1 = time.time()
+        self.vlm_time_total += t1 - t0
+        self.vlm_call_count += 1
         print("*" * 50)
-        print(f"[Pass 1] Wall time: {t1 - t0:.2f}s")
-        print(f"[Pass 1 Response]: {pass1_response}")
+        print(f"[Pass 1] Wall time: {t1 - t0:.2f}s  ({len(pass1_scenes)}/{_N_SAMPLES} parsed)")
 
-        scene = self._parse_scene_response(pass1_response)
-        print(f"[Pass 1 Scene]: {scene}")
-
-        if scene is None or not scene["target_visible"]:
-            print("[Pass 1] Target not visible — stopping")
+        if not pass1_scenes:
+            print("[Pass 1] All samples failed to parse — stopping")
             goal = {
                 "vel_x": 0.0, "vel_y": 0.0,
                 "heading": current_heading, "relative_heading": 0.0,
@@ -765,19 +793,48 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
             self.previous_goal_heading = current_heading
             return goal
 
-        # ---- Pass 2: Heading Prediction ----
-        if not scene["blocking_object_present"]:
+        # Majority vote on boolean fields
+        target_visible = sum(s["target_visible"] for s in pass1_scenes) > len(pass1_scenes) / 2
+        object_blocking = sum(s["object_blocking"] for s in pass1_scenes) > len(pass1_scenes) / 2
+        scene = {"target_visible": target_visible, "object_blocking": object_blocking}
+        print(f"[Pass 1 Aggregated]: {scene}")
+
+        if not scene["target_visible"]:
+            print("[Pass 1] Target not visible (majority) — stopping")
+            goal = {
+                "vel_x": 0.0, "vel_y": 0.0,
+                "heading": current_heading, "relative_heading": 0.0,
+                "stop": True, "obstructed": False,
+            }
+            print(f"[Final Goal]: {goal}")
+            print("*" * 50)
+            self.previous_goal_heading = current_heading
+            return goal
+
+        # ---- Pass 2: Heading Prediction (3 samples, median) ----
+        if not scene["object_blocking"]:
             pass2_prompt = STEERING_PROMPT_TEMPLATE.format(target=self.target_object)
         else:
             pass2_prompt = AVOIDANCE_PROMPT_TEMPLATE.format(target=self.target_object)
         t2 = time.time()
-        pass2_response = self.query_model(image, pass2_prompt)
+        pass2_headings = []
+        for i in range(_N_SAMPLES):
+            resp = self.query_model(image, pass2_prompt)
+            parsed = self._parse_heading_response(resp)
+            print(f"[Pass 2 Sample {i+1}] Response: {resp}")
+            print(f"[Pass 2 Sample {i+1}] Parsed: {parsed}")
+            if parsed is not None:
+                pass2_headings.append(parsed)
         t3 = time.time()
-        print(f"[Pass 2] Wall time: {t3 - t2:.2f}s")
-        print(f"[Pass 2 Response]: {pass2_response}")
+        self.vlm_time_total += t3 - t2
+        print(f"[Pass 2] Wall time: {t3 - t2:.2f}s  ({len(pass2_headings)}/{_N_SAMPLES} parsed)")
 
-        heading_raw = self._parse_heading_response(pass2_response)
-        print(f"[Pass 2 Heading]: {heading_raw}")
+        if not pass2_headings:
+            print("[Pass 2] All samples failed to parse — defaulting heading_raw=0.0")
+            heading_raw = 0.0
+        else:
+            heading_raw = float(np.median(pass2_headings))
+        print(f"[Pass 2 Aggregated heading_raw]: {heading_raw}")
 
         # Dead-zone
         if abs(heading_raw) < 0.1:
@@ -789,7 +846,7 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         if heading_raw == 0.0 and self.previous_goal_heading is not None:
             absolute_heading = self.previous_goal_heading
 
-        if scene["blocking_object_present"]:
+        if scene["object_blocking"]:
             vel_x = 1.0 - 0.65 * abs(heading_raw)
             print(f"[Blocking] Scaling vel_x: 1.0 - 0.65 * {abs(heading_raw):.3f} = {vel_x:.3f}")
         else:
@@ -797,26 +854,28 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
 
         # ---- Pass 3: Stop Check (bbox area fraction) — unblocked path only ----
         should_stop = False
-        if not scene["blocking_object_present"]:
+        if not scene["object_blocking"]:
             t4 = time.time()
-            pass3_response = self.query_model(
-                image,
-                STOP_PROMPT_TEMPLATE.format(target=self.target_object),
-            )
+            pass3_prompt = STOP_PROMPT_TEMPLATE.format(target=self.target_object)
+            pass3_stops = []
+            for i in range(_N_SAMPLES):
+                resp = self.query_model(image, pass3_prompt)
+                print(f"[Pass 3 Sample {i+1}] Response: {resp}")
+                stop_bbox = self._parse_stop_response(resp)
+                print(f"[Pass 3 Sample {i+1}] Bbox: {stop_bbox}")
+                if stop_bbox is not None:
+                    _x1, _y1, _x2, y2 = stop_bbox
+                    bottom_fraction = y2 / 1000.0
+                    print(f"[Pass 3 Sample {i+1}] Bbox bottom fraction: {bottom_fraction:.4f} (threshold={STOP_BOTTOM_THRESHOLD})")
+                    pass3_stops.append(bottom_fraction >= STOP_BOTTOM_THRESHOLD)
+                else:
+                    print(f"[Pass 3 Sample {i+1}] No bbox parsed — treating as not stop")
+                    pass3_stops.append(False)
             t5 = time.time()
-            print(f"[Pass 3] Wall time: {t5 - t4:.2f}s")
-            print(f"[Pass 3 Response]: {pass3_response}")
-
-            stop_bbox = self._parse_stop_response(pass3_response)
-            print(f"[Pass 3 Bbox]: {stop_bbox}")
-
-            if stop_bbox is not None:
-                x1, y1, x2, y2 = stop_bbox
-                bottom_fraction = y2 / 1000.0
-                print(f"[Pass 3] Bbox bottom fraction: {bottom_fraction:.4f} (threshold={STOP_BOTTOM_THRESHOLD})")
-                should_stop = bottom_fraction >= STOP_BOTTOM_THRESHOLD
-            else:
-                print("[Pass 3] No bbox parsed — not stopping")
+            self.vlm_time_total += t5 - t4
+            print(f"[Pass 3] Wall time: {t5 - t4:.2f}s  ({len(pass3_stops)}/{_N_SAMPLES} parsed)")
+            print(f"[Pass 3 Stop votes]: {pass3_stops}")
+            should_stop = sum(pass3_stops) > len(pass3_stops) / 2
         else:
             print("[Pass 3] Skipped (path blocked — avoidance active)")
 
