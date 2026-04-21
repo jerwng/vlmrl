@@ -42,6 +42,25 @@ STEERING_PROMPT_TEMPLATE = (
     '{{"heading_change": heading change value between -1 and 1}}'
 )
 
+# Alternative steering prompt: 5-way discrete commands.
+# Enabled in TwoPassVLMPredictor via discrete_heading=True (path clear).
+STEERING_PROMPT_DISCRETE_TEMPLATE = (
+    "You are guiding a robot toward the {target}.\n\n"
+    "The direct path to the {target} is clear.\n\n"
+    "Calculate a discrete heading change to steer toward the center of the {target}.\n\n"
+    "Definition:\n"
+    '- "left" = turn left\n'
+    '- "slight_left" = turn slightly left\n'
+    '- "straight" = go straight\n'
+    '- "slight_right" = turn slightly right\n'
+    '- "right" = turn right\n\n'
+    "Return only JSON:\n"
+    '{{"heading_change": "left" | "slight_left" | "straight" | "slight_right" | "right"}}'
+)
+# heading_raw magnitudes for discrete steering commands (full and slight turns)
+STEERING_DISCRETE_MAGNITUDE = 0.5
+STEERING_DISCRETE_SLIGHT_MAGNITUDE = 0.15
+
 AVOIDANCE_PROMPT_TEMPLATE = (
     "You are guiding a robot toward the {target}.\n\n"
     "The direct path to the {target} is blocked.\n\n"
@@ -72,6 +91,25 @@ AVOIDANCE_PROMPT_TEMPLATE = (
 #     '{{ "heading_change": heading change value between -1 and 1}}'
 # )
 
+# Alternative avoidance prompt: discrete left/right/straight commands.
+# Enabled in TwoPassVLMPredictor via discrete_heading=True (path blocked).
+AVOIDANCE_PROMPT_DISCRETE_TEMPLATE = (
+    "You are guiding a robot toward the {target}.\n\n"
+    "The direct path to the {target} is blocked.\n\n"
+    "Calculate a discrete heading change to steer toward the center of the {target}.\n\n"
+    "Definition:\n"
+    '- "left" = turn left\n'
+    '- "slight_left" = turn slightly left\n'
+    '- "straight" = go straight\n'
+    '- "slight_right" = turn slightly right\n'
+    '- "right" = turn right\n\n'
+    "Return only JSON:\n"
+    '{{"heading_change": "left" | "slight_left" | "straight" | "slight_right" | "right"}}'
+)
+# heading_raw magnitudes for discrete avoidance commands (full and slight turns)
+AVOIDANCE_DISCRETE_MAGNITUDE = 0.5
+AVOIDANCE_DISCRETE_SLIGHT_MAGNITUDE = 0.15
+
 STOP_PROMPT_TEMPLATE = (
     "You are guiding a robot toward the {target}.\n\n"
     "The {target} is visible and the path is clear.\n\n"
@@ -82,6 +120,42 @@ STOP_PROMPT_TEMPLATE = (
 )
 STOP_BOTTOM_THRESHOLD = 0.80  # stop when bbox bottom >= this fraction of image height
 
+# Alternative stop prompt: ask the model directly whether to stop.
+# Enabled in TwoPassVLMPredictor via direct_stop=True.
+STOP_PROMPT_DIRECT_TEMPLATE = (
+    "You are guiding a robot toward the {target}.\n\n"
+    "The {target} is visible and the path is clear.\n\n"
+    "Decide whether the robot should stop now.\n\n"
+    "Definition:\n"
+    "- true = the robot is within about 1 meter of the {target} and should stop\n"
+    "- false = the robot is more than about 1 meter from the {target} and should keep moving\n\n"
+    "Return only JSON:\n"
+    '{{"stop": true or false}}'
+)
+
+SINGLE_PASS_PROMPT_TEMPLATE = (
+    "You are guiding a robot toward the {target}.\n\n"
+    "Determine:\n"
+    "1. Is the {target} visible in the image?\n"
+    "2. If the {target} is visible, is there any other object between the robot and the {target} that blocks the direct path to it?\n"
+    "3. A normalized heading change in [-1, 1] to steer toward the center of the {target}\n"
+    "4. The 2D bounding box of the {target} as [x1, y1, x2, y2] in a 0-1000 coordinate grid (top-left origin)\n\n"
+     "Important:\n"
+    "- Objects on the floor can block the path.\n"
+    "- Do not ignore low obstacles on the floor.\n"
+    "- A blocking object is any object the robot would likely collide with if it moved directly toward the {target}.\n\n"
+    "Heading definition:\n"
+    "- negative = turn left\n"
+    "- positive = turn right\n"
+    "- 0 = go straight\n"
+    "- magnitude = how strong the turn should be\n\n"
+    "Important:\n"
+    "- If the target is not visible, set target_visible to false.\n"
+    "- If the target is not visible, set object_blocking to false.\n"
+    "- If the target is not visible, still return valid JSON and set bbox_2d to [0, 0, 0, 0].\n\n"
+    "Return only JSON:\n"
+    '{{"target_visible": true or false, "object_blocking": true or false, "heading_change": heading change value between -1 and 1, "bbox_2d": [x1, y1, x2, y2]}}'
+)
 
 class VLMGoalPredictor:
     """
@@ -157,6 +231,7 @@ class VLMGoalPredictor:
         """
         # Preprocess frame
         processed_frame = self.preprocess_frame(frame)
+
         
         # TODO: Implement VLM inference
         # This should:
@@ -261,6 +336,9 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         self.lora_adapter_path = lora_adapter_path
         self.last_detections: List[dict] = []
         self.previous_goal_heading = None  # Track previous heading for u=0 case
+        self.target_object = "red disk marker"
+        self.vlm_time_total = 0.0   # cumulative VLM inference wall time (seconds)
+        self.vlm_call_count = 0     # number of predict_goal calls
         super().__init__(model_path or "Qwen/Qwen3.5-9B", device)
 
     def load_model(self, model_path: str):
@@ -425,12 +503,87 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
             response = response[think_match.end():].strip()
         
         return response
+
+    def _parse_scene_response(self, response: str) -> Optional[dict]:
+        """Parse target visibility and blocking state from a response."""
+        try:
+            result = json.loads(response.strip())
+            if isinstance(result, dict):
+                return {
+                    "target_visible": bool(result.get("target_visible", False)),
+                    "object_blocking": bool(result.get("object_blocking", False)),
+                }
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        vis_match = re.search(r'"target_visible"\s*:\s*(true|false)', response, re.IGNORECASE)
+        blk_match = re.search(r'"object_blocking"\s*:\s*(true|false)', response, re.IGNORECASE)
+        if vis_match and blk_match:
+            return {
+                "target_visible": (vis_match.group(1).lower() == "true"),
+                "object_blocking": (blk_match.group(1).lower() == "true"),
+            }
+
+        return None
+
+    def _parse_heading_response(self, response: str) -> Optional[float]:
+        """Parse a continuous heading_change from a response."""
+        try:
+            result = json.loads(response.strip())
+            if isinstance(result, dict) and "heading_change" in result:
+                return float(np.clip(float(result["heading_change"]), -1.0, 1.0))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        heading_match = re.search(r'"heading_change"\s*:\s*(-?[0-9]*\.?[0-9]+)', response)
+        if heading_match:
+            return float(np.clip(float(heading_match.group(1)), -1.0, 1.0))
+
+        return None
+
+    def _parse_stop_response(self, response: str) -> Optional[Tuple[int, int, int, int]]:
+        """Parse a bbox_2d tuple from a response."""
+        try:
+            result = json.loads(response.strip())
+            if isinstance(result, dict):
+                bbox = result.get("bbox_2d")
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    return tuple(int(v) for v in bbox)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        bbox_match = re.search(
+            r'"bbox_2d"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]',
+            response,
+            re.DOTALL,
+        )
+        if bbox_match:
+            return tuple(int(bbox_match.group(i)) for i in range(1, 5))
+
+        return None
     
+    def _parse_single_pass_response(self, response: str) -> Optional[Dict[str, Any]]:
+        """Parse a single-pass response into scene, heading, and bbox fields."""
+        scene = self._parse_scene_response(response)
+        heading = self._parse_heading_response(response)
+        bbox = self._parse_stop_response(response)
+
+        if scene is None or heading is None or bbox is None:
+            print(f"WARNING: _parse_single_pass_response failed to parse: {response[:200]}")
+            return None
+
+        return {
+            "target_visible": scene["target_visible"],
+            "object_blocking": scene["object_blocking"],
+            "heading_change": heading,
+            "bbox_2d": bbox,
+        }
+
     def parse_response_to_goal(self, response: str, current_heading: float = 0.0) -> Dict[str, float]:
         """
         Parse VLM response into navigation goals.
 
-        Expects JSON format: [{"bbox_2d": [x1, y1, x2, y2], "label": "..."}]
+        Expects JSON format: {"target_visible": bool, "object_blocking": bool, "heading_change": float, "bbox_2d": [x1, y1, x2, y2]}.
         Coordinates are in [0, 1000] (normalized to model image grid).
 
         Args:
@@ -450,31 +603,33 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
             'stop': False,
         }
 
-        # Parse JSON bbox_2d format: {"bbox_2d": [x1, y1, x2, y2], ...}
-        bbox_match = re.search(r'"bbox"\s*:\s*\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]', response)
-
-        if bbox_match is None:
-            print("Red disk not detected in grounding output — stopping")
+        parsed = self._parse_single_pass_response(response)
+        if parsed is None:
+            print("Target not detected in single-pass output — stopping")
 
             goal['vel_x'] = 0.0
             goal['vel_y'] = 0.0
             goal['stop'] = True
             return goal
 
-        x1, y1, x2, y2 = (int(bbox_match.group(i)) for i in range(1, 5))
-        print(f"Detected bbox: ({x1},{y1}),({x2},{y2})")
+        if not parsed["target_visible"]:
+            print("Target not visible in single-pass output — stopping")
+            goal['vel_x'] = 0.0
+            goal['vel_y'] = 0.0
+            goal['stop'] = True
+            return goal
 
-        # Compute horizontal center in [0, 1000] and map to u in [-1, 1]
-        cx = (x1 + x2) / 2.0
-        u = (cx - 500.0) / 500.0
-        u = np.clip(u, -1.0, 1.0)
+        heading_raw = parsed["heading_change"]
+        object_blocking = parsed["object_blocking"]
+        x1, y1, x2, y2 = parsed["bbox_2d"]
+        print(f"Detected bbox: ({x1},{y1}),({x2},{y2})")
 
         # Compute bbox area fraction to decide stop
         bottom_fraction = y2 / 1000.0
         print(f"Bbox bottom fraction: {bottom_fraction:.4f} (threshold={STOP_BOTTOM_THRESHOLD})")
 
         if bottom_fraction >= STOP_BOTTOM_THRESHOLD:
-            print("Red disk is NEAR (large bbox) — signaling STOP")
+            print("Target is near (large bbox) — signaling STOP")
             goal['vel_x'] = 0.0
             goal['vel_y'] = 0.0
             goal['relative_heading'] = 0.0
@@ -482,15 +637,22 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
             goal['stop'] = True
             return goal
 
-        # Disk is visible but far: steer toward it
-        relative_heading_radians = -u * 45.0 * np.pi / 180.0
+        # Target is visible but far: steer using the model-provided heading change.
+        if abs(heading_raw) < 0.1:
+            heading_raw = 0.0
+
+        relative_heading_radians = -heading_raw * 45.0 * np.pi / 180.0
         absolute_heading = current_heading + relative_heading_radians
+        vel_x = 1.0
+        if object_blocking:
+            vel_x = 1.0 - 0.65 * abs(heading_raw)
+            print(f"[Blocking] Scaling vel_x: 1.0 - 0.65 * {abs(heading_raw):.3f} = {vel_x:.3f}")
 
         goal['relative_heading'] = relative_heading_radians
-        goal['vel_x'] = 1.0
+        goal['vel_x'] = vel_x
         goal['stop'] = False
 
-        if u == 0.0 and self.previous_goal_heading is not None:
+        if heading_raw == 0.0 and self.previous_goal_heading is not None:
             goal['heading'] = self.previous_goal_heading
         else:
             goal['heading'] = absolute_heading
@@ -563,85 +725,150 @@ class HuggingFaceVLMPredictor(VLMGoalPredictor):
         Returns:
             Dictionary with goal parameters (including absolute and relative heading)
         """
+        import time
+
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        # Preprocess frame
-        image = self.preprocess_frame(frame)
+        t0 = time.time()
+        try:
+            # Preprocess frame
+            image = self.preprocess_frame(frame)
 
-        # LoRA path: multi-object detection
-        if self.lora_adapter_path is not None:
+            # LoRA path: multi-object detection
+            if self.lora_adapter_path is not None:
+                if prompt is None:
+                    from vlmrl.vlm.finetune.dataset import DETECTION_PROMPT
+                    prompt = DETECTION_PROMPT
+
+                response = self.query_model(image, prompt)
+                print("*" * 50)
+                print(f"VLM Response (LoRA): {response}")
+
+                # Parse all detections; store on self for downstream consumers
+                self.last_detections = self.parse_detections_response(response)
+                print(f"Detections parsed: {len(self.last_detections)} object(s)")
+
+                if not self.last_detections:
+                    print("No objects detected — stopping")
+                    goal = {
+                        "vel_x": 0.0,
+                        "vel_y": 0.0,
+                        "heading": current_heading,
+                        "relative_heading": 0.0,
+                        "stop": True,
+                    }
+                else:
+                    # Steer toward the first detected object's bbox center
+                    first_bbox = self.last_detections[0]["bbox"]  # [x1, y1, x2, y2]
+                    x1, y1, x2, y2 = first_bbox
+                    cx = (x1 + x2) / 2.0
+                    u = np.clip((cx - 500.0) / 500.0, -1.0, 1.0)
+                    relative_heading_radians = -u * 45.0 * np.pi / 180.0
+                    absolute_heading = current_heading + relative_heading_radians
+                    goal = {
+                        "vel_x": 1.0,
+                        "vel_y": 0.0,
+                        "heading": absolute_heading,
+                        "relative_heading": relative_heading_radians,
+                        "stop": False,
+                    }
+                    print(f"Steering toward '{self.last_detections[0]['label']}' bbox={first_bbox} u={u:.3f}")
+
+                print(f"Parsed Goal: {goal}")
+                print("*" * 50)
+
+                if "heading" in goal:
+                    self.previous_goal_heading = goal["heading"]
+
+                return goal
+
+            # Original path: sampled single-pass prediction (no LoRA)
             if prompt is None:
-                from vlmrl.vlm.finetune.dataset import DETECTION_PROMPT
-                prompt = DETECTION_PROMPT
+                prompt = SINGLE_PASS_PROMPT_TEMPLATE.format(target=self.target_object)
 
-            response = self.query_model(image, prompt)
+            sample_count = 3
+            parsed_samples = []
+            responses = []
+            for i in range(sample_count):
+                response = self.query_model(image, prompt)
+                parsed = self._parse_single_pass_response(response)
+                responses.append(response)
+                print(f"[Single Pass Sample {i+1}] Response: {response}")
+                print(f"[Single Pass Sample {i+1}] Parsed: {parsed}")
+                if parsed is not None:
+                    parsed_samples.append(parsed)
+
             print("*" * 50)
-            print(f"VLM Response (LoRA): {response}")
+            print(f"Prompt: {prompt}")
+            print(f"Parsed samples: {len(parsed_samples)}/{sample_count}")
 
-            # Parse all detections; store on self for downstream consumers
-            self.last_detections = self.parse_detections_response(response)
-            print(f"Detections parsed: {len(self.last_detections)} object(s)")
-
-            if not self.last_detections:
-                print("No objects detected — stopping")
+            if not parsed_samples:
                 goal = {
-                    "vel_x": 0.0,
-                    "vel_y": 0.0,
-                    "heading": current_heading,
-                    "relative_heading": 0.0,
-                    "stop": True,
+                    'vel_x': 0.0,
+                    'vel_y': 0.0,
+                    'heading': current_heading,
+                    'relative_heading': 0.0,
+                    'stop': True,
                 }
+                print("All single-pass samples failed to parse — stopping")
             else:
-                # Steer toward the first detected object's bbox center
-                first_bbox = self.last_detections[0]["bbox"]  # [x1, y1, x2, y2]
-                x1, y1, x2, y2 = first_bbox
-                cx = (x1 + x2) / 2.0
-                u = np.clip((cx - 500.0) / 500.0, -1.0, 1.0)
-                relative_heading_radians = -u * 45.0 * np.pi / 180.0
-                absolute_heading = current_heading + relative_heading_radians
-                goal = {
-                    "vel_x": 1.0,
-                    "vel_y": 0.0,
-                    "heading": absolute_heading,
-                    "relative_heading": relative_heading_radians,
-                    "stop": False,
+                visible_votes = [sample["target_visible"] for sample in parsed_samples]
+                blocking_votes = [sample["object_blocking"] for sample in parsed_samples]
+                target_visible = sum(visible_votes) > len(visible_votes) / 2
+                object_blocking = sum(blocking_votes) > len(blocking_votes) / 2
+                print(f"Single-pass visible votes: {visible_votes}")
+                print(f"Single-pass blocking votes: {blocking_votes}")
+                if not target_visible:
+                    goal = {
+                        'vel_x': 0.0,
+                        'vel_y': 0.0,
+                        'heading': current_heading,
+                        'relative_heading': 0.0,
+                        'stop': True,
+                    }
+                    print("Single-pass majority vote: target not visible — stopping")
+                    print(f"Parsed Goal: {goal}")
+                    print("*" * 50)
+                    if "heading" in goal:
+                        self.previous_goal_heading = goal["heading"]
+                    return goal
+
+                aggregated_heading = float(np.median([sample["heading_change"] for sample in parsed_samples]))
+                stop_votes = [
+                    (sample["bbox_2d"][3] / 1000.0) >= STOP_BOTTOM_THRESHOLD
+                    for sample in parsed_samples
+                ]
+                should_stop = sum(stop_votes) > len(stop_votes) / 2
+                aggregated = {
+                    "target_visible": target_visible,
+                    "object_blocking": object_blocking,
+                    "heading_change": aggregated_heading,
+                    "bbox_2d": parsed_samples[0]["bbox_2d"],
                 }
-                print(f"Steering toward '{self.last_detections[0]['label']}' bbox={first_bbox} u={u:.3f}")
+                print(f"Aggregated single-pass output: {aggregated}")
+                print(f"Single-pass stop votes: {stop_votes}")
+                goal = self.parse_response_to_goal(json.dumps(aggregated), current_heading=current_heading)
+                if should_stop:
+                    goal = {
+                        'vel_x': 0.0,
+                        'vel_y': 0.0,
+                        'heading': current_heading,
+                        'relative_heading': 0.0,
+                        'stop': True,
+                    }
 
             print(f"Parsed Goal: {goal}")
             print("*" * 50)
 
+            # Store current goal heading for next prediction
             if "heading" in goal:
                 self.previous_goal_heading = goal["heading"]
 
             return goal
-
-        # Original path: red-disk detection (no LoRA)
-        if prompt is None:
-            prompt = (
-                "Locate the red circular disk on the ground in this image. "
-                "Output its bounding box. "
-                "If no red disk is visible, output \"not visible\"."
-            )
-
-        # Query model
-        response = self.query_model(image, prompt)
-        print("*" * 50)
-        print(f"Prompt: {prompt}")
-        print(f"VLM Response: {response}")
-
-        # Parse response to goal
-        goal = self.parse_response_to_goal(response, current_heading=current_heading)
-
-        print(f"Parsed Goal: {goal}")
-        print("*" * 50)
-
-        # Store current goal heading for next prediction
-        if "heading" in goal:
-            self.previous_goal_heading = goal["heading"]
-
-        return goal
+        finally:
+            self.vlm_time_total += time.time() - t0
+            self.vlm_call_count += 1
 
 
 class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
@@ -660,7 +887,17 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
 
     def __init__(self, target_object: str = "red disk marker",
                  model_path: str = None, device: str = "cuda",
-                 model_type: str = "auto", trust_remote_code: bool = True):
+                 model_type: str = "auto", trust_remote_code: bool = True,
+                 discrete_heading: bool = False, direct_stop: bool = False):
+        """
+        Args:
+            discrete_heading: If True, use discrete "left"/"right"/"straight" prompts
+                for both steering (path clear) and avoidance (path blocked) instead of
+                continuous heading_change values.
+            direct_stop: If True, use STOP_PROMPT_DIRECT_TEMPLATE which asks the model
+                directly for a stop: true/false decision instead of requesting a bbox
+                and applying a heuristic threshold.
+        """
         # Explicitly pass lora_adapter_path=None to disable LoRA in parent
         super().__init__(
             model_path=model_path,
@@ -670,6 +907,8 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
             lora_adapter_path=None,
         )
         self.target_object = target_object
+        self.discrete_heading = discrete_heading
+        self.direct_stop = direct_stop
         self.vlm_time_total = 0.0   # cumulative VLM inference wall time (seconds)
         self.vlm_call_count = 0     # number of predict_goal calls
 
@@ -744,6 +983,75 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         print(f"WARNING: _parse_stop_response failed to parse bbox: {response[:200]}")
         return None
 
+    def _parse_5way_discrete_response(self, response: str,
+                                       full_magnitude: float,
+                                       slight_magnitude: float) -> Optional[float]:
+        """Parse a 5-way discrete heading response into a heading_raw float.
+
+        Expects JSON: {"heading_change": "left" | "slight_left" | "straight" | "slight_right" | "right"}
+
+        Maps:
+            "left"         -> -full_magnitude
+            "slight_left"  -> -slight_magnitude
+            "straight"     ->  0.0
+            "slight_right" ->  slight_magnitude
+            "right"        ->  full_magnitude
+
+        Returns the heading_raw float, or None on parse failure.
+        """
+        _VALID = ("left", "slight_left", "straight", "slight_right", "right")
+        value = None
+        try:
+            result = json.loads(response.strip())
+            if isinstance(result, dict):
+                value = str(result.get("heading_change", "")).strip().lower()
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        if value not in _VALID:
+            # Match longer tokens first to avoid "left" matching inside "slight_left"
+            match = re.search(
+                r'"heading_change"\s*:\s*"(slight_left|slight_right|left|right|straight)"',
+                response, re.IGNORECASE,
+            )
+            if match:
+                value = match.group(1).lower()
+
+        if value not in _VALID:
+            print(f"WARNING: _parse_5way_discrete_response failed to parse: {response[:200]}")
+            return None
+
+        mapping = {
+            "left":          -full_magnitude,
+            "slight_left":   -slight_magnitude,
+            "straight":       0.0,
+            "slight_right":   slight_magnitude,
+            "right":          full_magnitude,
+        }
+        return mapping[value]
+
+    def _parse_stop_direct_response(self, response: str) -> Optional[bool]:
+        """Parse a direct stop response into a boolean.
+
+        Expects JSON: {"stop": true | false}
+
+        Returns True/False, or None on parse failure.
+        """
+        try:
+            result = json.loads(response.strip())
+            if isinstance(result, dict) and "stop" in result:
+                return bool(result["stop"])
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        # Regex fallback
+        match = re.search(r'"stop"\s*:\s*(true|false)', response, re.IGNORECASE)
+        if match:
+            return match.group(1).lower() == "true"
+
+        print(f"WARNING: _parse_stop_direct_response failed to parse: {response[:200]}")
+        return None
+
     def predict_goal(self, frame: np.ndarray, prompt: Optional[str] = None,
                      current_heading: float = 0.0) -> Dict[str, Any]:
         """
@@ -813,14 +1121,27 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
 
         # ---- Pass 2: Heading Prediction (3 samples, median) ----
         if not scene["object_blocking"]:
-            pass2_prompt = STEERING_PROMPT_TEMPLATE.format(target=self.target_object)
+            pass2_prompt = (
+                STEERING_PROMPT_DISCRETE_TEMPLATE if self.discrete_heading
+                else STEERING_PROMPT_TEMPLATE
+            ).format(target=self.target_object)
         else:
-            pass2_prompt = AVOIDANCE_PROMPT_TEMPLATE.format(target=self.target_object)
+            pass2_prompt = (
+                AVOIDANCE_PROMPT_DISCRETE_TEMPLATE if self.discrete_heading
+                else AVOIDANCE_PROMPT_TEMPLATE
+            ).format(target=self.target_object)
         t2 = time.time()
         pass2_headings = []
         for i in range(_N_SAMPLES):
             resp = self.query_model(image, pass2_prompt)
-            parsed = self._parse_heading_response(resp)
+            if self.discrete_heading and scene["object_blocking"]:
+                parsed = self._parse_5way_discrete_response(
+                    resp, AVOIDANCE_DISCRETE_MAGNITUDE, AVOIDANCE_DISCRETE_SLIGHT_MAGNITUDE)
+            elif self.discrete_heading:
+                parsed = self._parse_5way_discrete_response(
+                    resp, STEERING_DISCRETE_MAGNITUDE, STEERING_DISCRETE_SLIGHT_MAGNITUDE)
+            else:
+                parsed = self._parse_heading_response(resp)
             print(f"[Pass 2 Sample {i+1}] Response: {resp}")
             print(f"[Pass 2 Sample {i+1}] Parsed: {parsed}")
             if parsed is not None:
@@ -852,25 +1173,40 @@ class TwoPassVLMPredictor(HuggingFaceVLMPredictor):
         else:
             vel_x = 1.0
 
-        # ---- Pass 3: Stop Check (bbox area fraction) — unblocked path only ----
+        # ---- Pass 3: Stop Check — unblocked path only ----
+        # Mode A (default): ask for bbox, apply bottom-fraction threshold.
+        # Mode B (direct_stop=True): ask directly for stop: true/false.
         should_stop = False
         if not scene["object_blocking"]:
             t4 = time.time()
-            pass3_prompt = STOP_PROMPT_TEMPLATE.format(target=self.target_object)
             pass3_stops = []
-            for i in range(_N_SAMPLES):
-                resp = self.query_model(image, pass3_prompt)
-                print(f"[Pass 3 Sample {i+1}] Response: {resp}")
-                stop_bbox = self._parse_stop_response(resp)
-                print(f"[Pass 3 Sample {i+1}] Bbox: {stop_bbox}")
-                if stop_bbox is not None:
-                    _x1, _y1, _x2, y2 = stop_bbox
-                    bottom_fraction = y2 / 1000.0
-                    print(f"[Pass 3 Sample {i+1}] Bbox bottom fraction: {bottom_fraction:.4f} (threshold={STOP_BOTTOM_THRESHOLD})")
-                    pass3_stops.append(bottom_fraction >= STOP_BOTTOM_THRESHOLD)
-                else:
-                    print(f"[Pass 3 Sample {i+1}] No bbox parsed — treating as not stop")
-                    pass3_stops.append(False)
+            if self.direct_stop:
+                pass3_prompt = STOP_PROMPT_DIRECT_TEMPLATE.format(target=self.target_object)
+                for i in range(_N_SAMPLES):
+                    resp = self.query_model(image, pass3_prompt)
+                    print(f"[Pass 3 Sample {i+1}] Response: {resp}")
+                    stop_flag = self._parse_stop_direct_response(resp)
+                    print(f"[Pass 3 Sample {i+1}] Stop: {stop_flag}")
+                    if stop_flag is not None:
+                        pass3_stops.append(stop_flag)
+                    else:
+                        print(f"[Pass 3 Sample {i+1}] Parse failed — treating as not stop")
+                        pass3_stops.append(False)
+            else:
+                pass3_prompt = STOP_PROMPT_TEMPLATE.format(target=self.target_object)
+                for i in range(_N_SAMPLES):
+                    resp = self.query_model(image, pass3_prompt)
+                    print(f"[Pass 3 Sample {i+1}] Response: {resp}")
+                    stop_bbox = self._parse_stop_response(resp)
+                    print(f"[Pass 3 Sample {i+1}] Bbox: {stop_bbox}")
+                    if stop_bbox is not None:
+                        _x1, _y1, _x2, y2 = stop_bbox
+                        bottom_fraction = y2 / 1000.0
+                        print(f"[Pass 3 Sample {i+1}] Bbox bottom fraction: {bottom_fraction:.4f} (threshold={STOP_BOTTOM_THRESHOLD})")
+                        pass3_stops.append(bottom_fraction >= STOP_BOTTOM_THRESHOLD)
+                    else:
+                        print(f"[Pass 3 Sample {i+1}] No bbox parsed — treating as not stop")
+                        pass3_stops.append(False)
             t5 = time.time()
             self.vlm_time_total += t5 - t4
             print(f"[Pass 3] Wall time: {t5 - t4:.2f}s  ({len(pass3_stops)}/{_N_SAMPLES} parsed)")
@@ -964,7 +1300,14 @@ def create_vlm_predictor(predictor_type: str = "dummy", **kwargs) -> VLMGoalPred
         return HuggingFaceVLMPredictor(**kwargs)
     elif predictor_type == "twopass":
         target_object = kwargs.pop("target_object", "red disk marker")
-        return TwoPassVLMPredictor(target_object=target_object, **kwargs)
+        discrete_heading = kwargs.pop("discrete_heading", False)
+        direct_stop = kwargs.pop("direct_stop", False)
+        return TwoPassVLMPredictor(
+            target_object=target_object,
+            discrete_heading=discrete_heading,
+            direct_stop=direct_stop,
+            **kwargs,
+        )
     elif predictor_type == "openvla":
         return OpenVLAGoalPredictor(**kwargs)
     else:

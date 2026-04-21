@@ -171,6 +171,12 @@ def main():
                         help='Terminate when average planar speed over the window drops below this value (default: 0.1)')
     parser.add_argument('--low_velocity_window', type=int, default=100,
                         help='Window size in steps for low-velocity termination; set to 0 to disable (default: 100)')
+    parser.add_argument('--discrete_heading', action='store_true', default=False,
+                        help='Use 5-way discrete heading prompts (left/slight_left/straight/slight_right/right) '
+                             'for both steering and avoidance passes.')
+    parser.add_argument('--direct_stop', action='store_true', default=False,
+                        help='Ask the VLM directly for stop: true/false instead of predicting a bbox '
+                             'and applying a heuristic threshold.')
     args = parser.parse_args()
 
     # Discover all scenario directories
@@ -203,8 +209,15 @@ def main():
     config.experiment.env_params["headless"] = True
 
     print(f"Loading VLM on {args.vlm_device}...")
-    vlm_predictor = create_vlm_predictor('twopass', device=args.vlm_device)
+    vlm_predictor = create_vlm_predictor(
+        'huggingface',
+        device=args.vlm_device,
+        # discrete_heading=args.discrete_heading,
+        # direct_stop=args.direct_stop,
+    )
     print("VLM loaded.")
+    print(f"Discrete Heading: {args.discrete_heading}")
+    print(f"Direct Stop     : {args.direct_stop}")
 
     run_suffix = str(os.getpid())
     results = {}
@@ -362,6 +375,8 @@ def main():
             "success_velocity_threshold": args.success_velocity,
             "low_velocity_threshold": args.low_velocity_threshold,
             "low_velocity_window": args.low_velocity_window,
+            "discrete_heading": args.discrete_heading,
+            "direct_stop": args.direct_stop,
             "total_scenarios": eval_counter,
             "outcome_counts": outcome_counts,
         },

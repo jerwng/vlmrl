@@ -51,6 +51,16 @@ def main():
         help='Name of the target object for the two-pass predictor (default: "red disk marker"). '
              'Used only when --predictor_type is "twopass".'
     )
+    parser.add_argument(
+        '--discrete_heading', action='store_true', default=False,
+        help='Use 5-way discrete heading prompts (left/slight_left/straight/slight_right/right) '
+             'for both steering and avoidance. Only applies when --predictor_type is "twopass".'
+    )
+    parser.add_argument(
+        '--direct_stop', action='store_true', default=False,
+        help='Ask the VLM directly for stop: true/false instead of predicting a bbox and '
+             'applying a heuristic threshold. Only applies when --predictor_type is "twopass".'
+    )
 
     # Environment configuration
     parser.add_argument('--use_mujoco', action='store_true',
@@ -97,6 +107,8 @@ def main():
             device=args.vlm_device,
             trust_remote_code=args.trust_remote_code,
             target_object=args.target_object,
+            discrete_heading=args.discrete_heading,
+            direct_stop=args.direct_stop,
         )
     else:
         # 'huggingface' (default) — unchanged behavior
@@ -127,6 +139,8 @@ def main():
     print(f"Predictor Type: {args.predictor_type}")
     if args.predictor_type == 'twopass':
         print(f"Target Object: {args.target_object}")
+        print(f"Discrete Heading: {args.discrete_heading}")
+        print(f"Direct Stop: {args.direct_stop}")
     print(f"Update Frequency: Every {args.vlm_update_freq} steps")
     if args.lora_adapter_path:
         print(f"LoRA Adapter: {args.lora_adapter_path}")
